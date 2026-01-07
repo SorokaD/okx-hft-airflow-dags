@@ -37,7 +37,72 @@ TimescaleDB Node (167.86.110.201)
 Collector Node (217.216.73.20)
   - okx-hft-collector
   - WebSocket -> OKX API -> okx_raw.* tables
+
+## Как репозитории работают вместе
+
+Платформа намеренно разделена на два независимых слоя:
+
+### okx-hft-ops (Infrastructure layer)
+Отвечает за:
+- запуск Airflow (webserver, scheduler, metadata DB)
+- docker-compose конфигурацию
+- Traefik, сети, volumes
+- секреты и SSH-ключи
+- git-sync для доставки DAG-ов
+
+Этот репозиторий определяет **КАК и ГДЕ работает Airflow**,  
+но не содержит бизнес-логики пайплайнов.
+
+---
+
+### okx-hft-airflow-dags (Logic layer, этот репозиторий)
+Отвечает за:
+- DAG-и
+- data health checks
+- ETL/ELT пайплайны
+- общую библиотеку для DAG-ов (`okx.common`)
+
+Этот репозиторий определяет **ЧТО именно делает Airflow**.
+
+---
+
+### Почему это важно
+
+- Инфраструктура меняется редко → ops репозиторий стабилен
+- DAG-и меняются часто → dags репозиторий развивается быстро
+- Обновление DAG-ов не требует SSH-доступа к серверу
+- Деплой DAG-а = `git push`
+
+Такой подход близок к GitOps и хорошо масштабируется с ростом проекта.
 ```
+
+## Поток выполнения данных (Data Flow)
+
+1. **Collector Node**
+   - WebSocket соединения с OKX API
+   - Получение trades, orderbook, funding
+   - Асинхронные INSERT в `okx_raw.*` (TimescaleDB)
+
+2. **TimescaleDB Node**
+   - Хранение raw данных (`okx_raw`)
+   - Core-таблицы (`okx_core`)
+   - Feature layer (`okx_feat`)
+   - Hypertables + retention policies
+
+3. **Airflow (OPS Node)**
+   - Оркестрация ETL
+   - Контроль качества данных
+   - Health-проверки
+   - Расчёт фич и агрегаций
+
+4. **Analytics / ML**
+   - Superset (дашборды)
+   - MLflow (эксперименты)
+   - Executor (торговая логика)
+
+Airflow **не участвует в real-time ingestion**,  
+он работает поверх уже записанных данных и контролирует их состояние.
+
 
 ## Структура репозитория
 
@@ -262,3 +327,22 @@ git-sync:
 
 - **Team**: OKX Data Team
 - **Owner**: okx-data
+
+## Как происходит деплой DAG-ов (подробно)
+
+1. Разработчик вносит изменения в DAG или общий код
+2. Делает `git push` в ветку `main`
+3. GitHub Actions выполняет:
+   - проверку импорта DAG-ов
+   - lint (ruff / black)
+4. После merge в `main`:
+   - сервис `git-sync` на OPS-ноде подтягивает репозиторий
+   - код попадает в Docker volume `airflow_dags_git`
+5. Airflow Scheduler:
+   - автоматически перепарсивает DAG-файлы
+   - регистрирует новые или обновлённые DAG-и
+
+⏱ Среднее время доставки DAG-а в production: **30–60 секунд**
+
+Rollback:
+- `git revert` → push → git-sync → Airflow
