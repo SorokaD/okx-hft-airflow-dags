@@ -9,7 +9,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 
 CONN_ID = "timescaledb"
-DB_NAME_EXPECTED = "okx_hft"  # для самопроверки
+DB_NAME_EXPECTED = "okx_hft"  # самопроверка
 
 
 # ---------------------------
@@ -20,7 +20,7 @@ DB_NAME_EXPECTED = "okx_hft"  # для самопроверки
 class FreshnessCheck:
     name: str
     table_fq: str               # schema.table
-    ts_col: str                 # ts_ingest OR ts_event OR etc. (timestamptz)
+    ts_col: str                 # timestamptz
     max_lag_seconds: int        # если лаг больше -> FAIL
 
 
@@ -32,36 +32,40 @@ class FreshnessMsCheck:
     max_lag_seconds: int
 
 
-FRESHNESS_CHECKS = [
-    # Подстрой под твои “источники истины”:
-    FreshnessCheck(
-        name="raw_trades_ingest",
-        table_fq="okx_raw.trades",
-        ts_col="ts_ingest_ms",
-        max_lag_seconds=120,    # 2 минуты
-    ),
-    FreshnessCheck(
-        name="raw_funding_rates_ingest",
-        table_fq="okx_raw.funding_rates",
-        ts_col="ts_ingest_ms",
-        max_lag_seconds=900,    # funding редко, но raw тик может приходить чаще; поставим 15 мин
-    ),
+# !!! СЮДА — ТОЛЬКО timestamptz колонки !!!
+FRESHNESS_CHECKS: list[FreshnessCheck] = [
+    # пример, оставь/удали под свои реальные timestamptz таблицы
+    # FreshnessCheck(
+    #     name="raw_funding_rates_ingest",
+    #     table_fq="okx_raw.funding_rates",
+    #     ts_col="ts_ingest",
+    #     max_lag_seconds=900,
+    # ),
 ]
 
-# Если у тебя есть таблицы с ts_ingest_ms (bigint):
-FRESHNESS_MS_CHECKS = [
+# !!! СЮДА — все *_ms bigint !!!
+FRESHNESS_MS_CHECKS: list[FreshnessMsCheck] = [
+    FreshnessMsCheck(
+        name="raw_trades_ingest_ms",
+        table_fq="okx_raw.trades",
+        ts_ms_col="ts_ingest_ms",
+        max_lag_seconds=120,    # 2 минуты
+    ),
     FreshnessMsCheck(
         name="raw_orderbook_updates_ingest_ms",
         table_fq="okx_raw.orderbook_updates",
         ts_ms_col="ts_ingest_ms",
         max_lag_seconds=30,     # стакан должен идти почти постоянно
     ),
+    # если funding_rates тоже на ms — добавь сюда:
+    # FreshnessMsCheck(
+    #     name="raw_funding_rates_ingest_ms",
+    #     table_fq="okx_raw.funding_rates",
+    #     ts_ms_col="ts_ingest_ms",
+    #     max_lag_seconds=900,
+    # ),
 ]
 
-
-# ---------------------------
-# SQL утилиты
-# ---------------------------
 
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
@@ -78,10 +82,6 @@ def _lag_seconds_from_ts(dt: datetime, now: datetime) -> float:
     return (now - dt).total_seconds()
 
 
-# ---------------------------
-# Health logic
-# ---------------------------
-
 def run_data_health() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
 
@@ -91,15 +91,15 @@ def run_data_health() -> None:
         raise RuntimeError(f"DB ping failed: {v}")
 
     # 1) sanity: db name
-    dbname = hook.get_first(SQL_CURRENT_DB)
-    dbname = (dbname[0] if dbname else None)
+    dbname_row = hook.get_first(SQL_CURRENT_DB)
+    dbname = (dbname_row[0] if dbname_row else None)
     if DB_NAME_EXPECTED and dbname != DB_NAME_EXPECTED:
         raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
 
     now = _now_utc()
 
-    results = []
-    failures = []
+    results: list[tuple] = []
+    failures: list[str] = []
 
     # 2) freshness (timestamptz)
     for chk in FRESHNESS_CHECKS:
@@ -121,7 +121,7 @@ def run_data_health() -> None:
                 f"{chk.name}: lag={int(lag)}s > {chk.max_lag_seconds}s (table={chk.table_fq}, col={chk.ts_col})"
             )
 
-    # 3) freshness (epoch ms)
+    # 3) freshness (epoch ms bigint)
     for chk in FRESHNESS_MS_CHECKS:
         sql = f"SELECT max({chk.ts_ms_col}) FROM {chk.table_fq};"
         row = hook.get_first(sql)
@@ -136,7 +136,9 @@ def run_data_health() -> None:
         max_ts = datetime.fromtimestamp(max_ms / 1000.0, tz=timezone.utc)
         lag = (now - max_ts).total_seconds()
         status = "OK" if lag <= chk.max_lag_seconds else "FAIL"
-        results.append((chk.name, max_ts.isoformat(), int(lag), chk.max_lag_seconds, status))
+
+        # value печатаем так, чтобы видно было и ms и iso
+        results.append((chk.name, f"{max_ms} -> {max_ts.isoformat()}", int(lag), chk.max_lag_seconds, status))
 
         if status == "FAIL":
             failures.append(
@@ -144,8 +146,6 @@ def run_data_health() -> None:
             )
 
     # 4) gap check (orderbook_updates ts_event_ms) за последний час
-    # Здесь “качество стрима”: если есть огромные провалы между соседними ts_event_ms — плохо.
-    # Подстрой таблицу/колонку под реальность.
     gap_sql = """
     WITH x AS (
       SELECT ts_event_ms
@@ -166,34 +166,31 @@ def run_data_health() -> None:
     gaps_cnt = int(row[0]) if row and row[0] is not None else 0
     max_gap_ms = int(row[1]) if row and row[1] is not None else None
 
-    # порог на max gap (например 5 секунд)
     max_gap_threshold_ms = 5_000
     if max_gap_ms is None:
-        # если данных нет — это подозрительно (но бывает на пустой базе)
         failures.append("orderbook_gap_1h: no data in last hour (max_gap_ms is NULL)")
-        results.append(("orderbook_gap_1h", "NULL", None, max_gap_threshold_ms // 1000, "FAIL"))
+        results.append(("orderbook_gap_1h", "NULL", None, max_gap_threshold_ms, "FAIL"))
     else:
         status = "OK" if max_gap_ms <= max_gap_threshold_ms else "FAIL"
         results.append(("orderbook_gap_1h", f"gaps_cnt={gaps_cnt}", max_gap_ms, max_gap_threshold_ms, status))
         if status == "FAIL":
             failures.append(f"orderbook_gap_1h: max_gap_ms={max_gap_ms} > {max_gap_threshold_ms}ms")
 
-    # 5) печать отчёта
+    # 5) отчёт
     print(f"[okx_data_health_5m] now_utc={now.isoformat()} db={dbname}")
     for r in results:
         print(f"[health] name={r[0]} value={r[1]} lag={r[2]} threshold={r[3]} status={r[4]}")
 
     # 6) итог
     if failures:
-        msg = " ; ".join(failures)
-        raise RuntimeError(f"DATA HEALTH FAIL: {msg}")
+        raise RuntimeError("DATA HEALTH FAIL: " + " ; ".join(failures))
 
     print("[okx_data_health_5m] OK")
 
 
 default_args = {
     "owner": "okx-data",
-    "retries": 0,  # health обычно не надо ретраить, лучше сразу сигналить
+    "retries": 0,
     "execution_timeout": timedelta(seconds=30),
 }
 
