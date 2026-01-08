@@ -30,15 +30,17 @@ class EtlConfig:
     # инкремент в raw (epoch ms bigint)
     raw_wm_ms_col: str = "ts_ingest_ms"
 
-    # конфликт-ключ (timescale hypertable требует ts_event в unique)
-    conflict_cols: tuple[str, str] = ("snapshot_id", "ts_event")
+    # дедуп внутри батча по "смысловому ключу" снапшота
+    # (если в raw есть повторы на одном уровне, берём самый свежий по ts_ingest_ms)
+    dedup_partition_cols_raw: tuple[str, ...] = ("instid", "ts_event_ms", "side", "level")
+    dedup_order_col_raw: str = "ts_ingest_ms"
 
     # батчи и лимиты
     batch_size: int = 300_000
     max_loops: int = 20
 
     # safety
-    execution_timeout_sec: int = 120
+    execution_timeout_sec: int = 180
 
 
 CFG = EtlConfig()
@@ -67,6 +69,54 @@ def _get_core_watermark_ms(hook: PostgresHook) -> int:
     return _ms_from_timestamptz(max_ts)
 
 
+def _sql_increment_once(last_ms: int) -> str:
+    # Формируем PARTITION BY список
+    part_cols = ", ".join([f"b.{c}" for c in CFG.dedup_partition_cols_raw])
+
+    return f"""
+    WITH batch AS (
+      SELECT *
+      FROM {CFG.raw_table_fq}
+      WHERE {CFG.raw_wm_ms_col} > {last_ms}
+      ORDER BY {CFG.raw_wm_ms_col}
+      LIMIT {CFG.batch_size}
+    ),
+    dedup AS (
+      SELECT *
+      FROM (
+        SELECT
+          b.*,
+          row_number() OVER (
+            PARTITION BY {part_cols}
+            ORDER BY b.{CFG.dedup_order_col_raw} DESC
+          ) AS rn
+        FROM batch b
+      ) x
+      WHERE x.rn = 1
+    ),
+    ins AS (
+      INSERT INTO {CFG.core_table_fq}
+        (snapshot_id, inst_id, ts_event, side, level_no, price_px, size_qty, ts_ingest)
+      SELECT
+        d.snapshot_id,
+        d.instid::text,
+        to_timestamp(d.ts_event_ms / 1000.0),
+        CASE d.side WHEN 1 THEN 'bid' WHEN 2 THEN 'ask' ELSE NULL END,
+        d.level::int2,
+        d.price,
+        d.size,
+        to_timestamp(d.ts_ingest_ms / 1000.0)
+      FROM dedup d
+      RETURNING 1
+    )
+    SELECT
+      COALESCE((SELECT max({CFG.raw_wm_ms_col}) FROM batch), {last_ms}) AS new_last_ms,
+      (SELECT count(*) FROM batch) AS batch_rows,
+      (SELECT count(*) FROM dedup) AS dedup_rows,
+      (SELECT count(*) FROM ins) AS inserted_rows;
+    """
+
+
 def run_sync_orderbook_snapshots() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
 
@@ -82,8 +132,10 @@ def run_sync_orderbook_snapshots() -> None:
         raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
 
     now = _now_utc()
-    v_last_ms = _get_core_watermark_ms(hook)
+    last_ms = _get_core_watermark_ms(hook)
 
+    total_batch = 0
+    total_dedup = 0
     total_inserted = 0
     loops = 0
 
@@ -91,55 +143,34 @@ def run_sync_orderbook_snapshots() -> None:
     while loops < CFG.max_loops:
         loops += 1
 
-        # Берём батч raw и вставляем в core. Возвращаем:
-        # - новый watermark (max ts_ingest_ms из батча)
-        # - сколько реально вставили (с учётом ON CONFLICT DO NOTHING)
-        sql = f"""
-        WITH batch AS (
-          SELECT *
-          FROM {CFG.raw_table_fq}
-          WHERE {CFG.raw_wm_ms_col} > {v_last_ms}
-          ORDER BY {CFG.raw_wm_ms_col}
-          LIMIT {CFG.batch_size}
-        ),
-        ins AS (
-          INSERT INTO {CFG.core_table_fq}
-            (snapshot_id, inst_id, ts_event, side, level_no, price_px, size_qty, ts_ingest)
-          SELECT
-            b.snapshot_id,
-            b.instid::text,
-            to_timestamp(b.ts_event_ms / 1000.0),
-            CASE b.side WHEN 1 THEN 'bid' WHEN 2 THEN 'ask' ELSE NULL END,
-            b.level::int2,
-            b.price,
-            b.size,
-            to_timestamp(b.ts_ingest_ms / 1000.0)
-          FROM batch b
-          ON CONFLICT ({CFG.conflict_cols[0]}, {CFG.conflict_cols[1]}) DO NOTHING
-          RETURNING 1
-        )
-        SELECT
-          COALESCE((SELECT max({CFG.raw_wm_ms_col}) FROM batch), {v_last_ms}) AS new_last_ms,
-          (SELECT count(*) FROM ins) AS inserted_rows;
-        """
-
+        sql = _sql_increment_once(last_ms)
         row = hook.get_first(sql)
         if not row:
             raise RuntimeError("ETL query returned no result row")
 
-        v_new_last_ms = int(row[0])
-        inserted = int(row[1]) if row[1] is not None else 0
+        new_last_ms = int(row[0])
+        batch_rows = int(row[1]) if row[1] is not None else 0
+        dedup_rows = int(row[2]) if row[2] is not None else 0
+        inserted_rows = int(row[3]) if row[3] is not None else 0
 
-        total_inserted += inserted
-        v_last_ms = v_new_last_ms
+        total_batch += batch_rows
+        total_dedup += dedup_rows
+        total_inserted += inserted_rows
 
-        # если вставок не было — дальше смысла нет
-        if inserted == 0:
+        last_ms = new_last_ms
+
+        # Если батч пустой — данных больше нет
+        if batch_rows == 0:
+            break
+
+        # Если после дедупа/вставки ничего не вставилось — дальше крутиться бессмысленно
+        # (обычно значит одни повторы)
+        if inserted_rows == 0:
             break
 
     print(
-        f"[{DAG_ID}] now_utc={now.isoformat()} db={dbname} "
-        f"loops={loops} total_inserted={total_inserted} last_ms={v_last_ms}"
+        f"[{DAG_ID}] now_utc={now.isoformat()} db={dbname} loops={loops} "
+        f"batch={total_batch} dedup={total_dedup} inserted={total_inserted} last_ms={last_ms}"
     )
 
 
@@ -152,7 +183,7 @@ default_args = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="ETL: incremental raw->core for orderbook_snapshots (batched, idempotent)",
+    description="ETL: incremental raw->core for orderbook_snapshots (batch + dedup-in-batch)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
