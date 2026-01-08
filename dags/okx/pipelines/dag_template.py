@@ -17,8 +17,8 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"  # самопроверка, чтобы не залить "не туда"
 
 # DAG identity
-DAG_ID = "okx__raw_to_core__<entity>"         # <-- заполни
-SCHEDULE = "*/1 * * * *"                      # <-- заполни (или None для manual)
+DAG_ID = "okx__raw_to_core__<entity>"  # <-- заполни
+SCHEDULE = "*/1 * * * *"  # <-- заполни (или None для manual)
 
 # Tags (единый набор)
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb"]
@@ -32,18 +32,24 @@ SQL_CURRENT_DB = "SELECT current_database();"
 # 1) Config (всё настраиваемое — только тут)
 # ============================================================
 
+
 @dataclass(frozen=True)
 class EtlConfig:
     # tables
-    raw_table_fq: str = "okx_raw.<raw_table>"              # schema.table
-    core_table_fq: str = "okx_core.<core_table>"           # schema.table
+    raw_table_fq: str = "okx_raw.<raw_table>"  # schema.table
+    core_table_fq: str = "okx_core.<core_table>"  # schema.table
 
     # watermark
-    core_wm_col: str = "ts_ingest"                         # timestamptz
-    raw_wm_ms_col: str = "ts_ingest_ms"                    # bigint epoch-ms
+    core_wm_col: str = "ts_ingest"  # timestamptz
+    raw_wm_ms_col: str = "ts_ingest_ms"  # bigint epoch-ms
 
     # dedup within batch (partition by “semantic key”, take freshest by ts_ingest_ms)
-    dedup_partition_cols_raw: tuple[str, ...] = ("instid", "ts_event_ms", "side", "level")
+    dedup_partition_cols_raw: tuple[str, ...] = (
+        "instid",
+        "ts_event_ms",
+        "side",
+        "level",
+    )
     dedup_order_col_raw: str = "ts_ingest_ms"
 
     # batching/limits
@@ -56,7 +62,9 @@ class EtlConfig:
     retry_delay_sec: int = 60
 
     # behavior knobs
-    stop_if_inserted_zero: bool = True  # stop loop if inserted_rows==0 (typically duplicates only)
+    stop_if_inserted_zero: bool = (
+        True  # stop loop if inserted_rows==0 (typically duplicates only)
+    )
 
 
 CFG = EtlConfig()
@@ -65,6 +73,7 @@ CFG = EtlConfig()
 # ============================================================
 # 2) Helpers
 # ============================================================
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -84,9 +93,11 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
 
     # database name sanity
     row = hook.get_first(SQL_CURRENT_DB)
-    dbname = (row[0] if row else None)
+    dbname = row[0] if row else None
     if DB_NAME_EXPECTED and dbname != DB_NAME_EXPECTED:
-        raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
+        raise RuntimeError(
+            f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})"
+        )
 
     return dbname or "UNKNOWN"
 
@@ -173,6 +184,7 @@ def _log_run(
 # 3) Main callable (single responsibility: sync)
 # ============================================================
 
+
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     dbname = _db_sanity_checks(hook)
@@ -208,7 +220,14 @@ def run_sync() -> None:
         if CFG.stop_if_inserted_zero and inserted_rows == 0:
             break
 
-    _log_run(dag_id=DAG_ID, now=now, dbname=dbname, loops=loops, last_ms=last_ms, totals=totals)
+    _log_run(
+        dag_id=DAG_ID,
+        now=now,
+        dbname=dbname,
+        loops=loops,
+        last_ms=last_ms,
+        totals=totals,
+    )
 
 
 # ============================================================

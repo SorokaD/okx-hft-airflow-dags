@@ -19,6 +19,7 @@ SCHEDULE = "*/1 * * * *"  # раз в минуту
 # Настройки ETL
 # ---------------------------
 
+
 @dataclass(frozen=True)
 class EtlConfig:
     raw_table_fq: str = "okx_raw.orderbook_snapshots"
@@ -32,7 +33,12 @@ class EtlConfig:
 
     # дедуп внутри батча по "смысловому ключу" снапшота
     # (если в raw есть повторы на одном уровне, берём самый свежий по ts_ingest_ms)
-    dedup_partition_cols_raw: tuple[str, ...] = ("instid", "ts_event_ms", "side", "level")
+    dedup_partition_cols_raw: tuple[str, ...] = (
+        "instid",
+        "ts_event_ms",
+        "side",
+        "level",
+    )
     dedup_order_col_raw: str = "ts_ingest_ms"
 
     # батчи и лимиты
@@ -127,9 +133,11 @@ def run_sync_orderbook_snapshots() -> None:
 
     # 1) sanity: db name
     dbname_row = hook.get_first(SQL_CURRENT_DB)
-    dbname = (dbname_row[0] if dbname_row else None)
+    dbname = dbname_row[0] if dbname_row else None
     if DB_NAME_EXPECTED and dbname != DB_NAME_EXPECTED:
-        raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
+        raise RuntimeError(
+            f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})"
+        )
 
     now = _now_utc()
     last_ms = _get_core_watermark_ms(hook)

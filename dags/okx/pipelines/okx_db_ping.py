@@ -20,7 +20,9 @@ def ping_db() -> None:
 
     # Бонус: узнаем имя базы (полезно для валидации, что подключились куда надо)
     dbname = hook.get_first("SELECT current_database();")
-    print(f"OK: SELECT 1 returned {val[0]}; current_database()={dbname[0] if dbname else None}")
+    print(
+        f"OK: SELECT 1 returned {val[0]}; current_database()={dbname[0] if dbname else None}"
+    )
 
 
 default_args = {

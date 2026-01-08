@@ -16,19 +16,20 @@ DB_NAME_EXPECTED = "okx_hft"  # самопроверка
 # Настройки health-порогов
 # ---------------------------
 
+
 @dataclass(frozen=True)
 class FreshnessCheck:
     name: str
-    table_fq: str               # schema.table
-    ts_col: str                 # timestamptz
-    max_lag_seconds: int        # если лаг больше -> FAIL
+    table_fq: str  # schema.table
+    ts_col: str  # timestamptz
+    max_lag_seconds: int  # если лаг больше -> FAIL
 
 
 @dataclass(frozen=True)
 class FreshnessMsCheck:
     name: str
-    table_fq: str               # schema.table
-    ts_ms_col: str              # bigint ms epoch
+    table_fq: str  # schema.table
+    ts_ms_col: str  # bigint ms epoch
     max_lag_seconds: int
 
 
@@ -49,13 +50,13 @@ FRESHNESS_MS_CHECKS: list[FreshnessMsCheck] = [
         name="raw_trades_ingest_ms",
         table_fq="okx_raw.trades",
         ts_ms_col="ts_ingest_ms",
-        max_lag_seconds=120,    # 2 минуты
+        max_lag_seconds=120,  # 2 минуты
     ),
     FreshnessMsCheck(
         name="raw_orderbook_updates_ingest_ms",
         table_fq="okx_raw.orderbook_updates",
         ts_ms_col="ts_ingest_ms",
-        max_lag_seconds=30,     # стакан должен идти почти постоянно
+        max_lag_seconds=30,  # стакан должен идти почти постоянно
     ),
     # если funding_rates тоже на ms — добавь сюда:
     # FreshnessMsCheck(
@@ -92,9 +93,11 @@ def run_data_health() -> None:
 
     # 1) sanity: db name
     dbname_row = hook.get_first(SQL_CURRENT_DB)
-    dbname = (dbname_row[0] if dbname_row else None)
+    dbname = dbname_row[0] if dbname_row else None
     if DB_NAME_EXPECTED and dbname != DB_NAME_EXPECTED:
-        raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
+        raise RuntimeError(
+            f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})"
+        )
 
     now = _now_utc()
 
@@ -114,7 +117,9 @@ def run_data_health() -> None:
 
         lag = _lag_seconds_from_ts(max_ts, now)
         status = "OK" if lag <= chk.max_lag_seconds else "FAIL"
-        results.append((chk.name, max_ts.isoformat(), int(lag), chk.max_lag_seconds, status))
+        results.append(
+            (chk.name, max_ts.isoformat(), int(lag), chk.max_lag_seconds, status)
+        )
 
         if status == "FAIL":
             failures.append(
@@ -128,7 +133,9 @@ def run_data_health() -> None:
         max_ms = row[0] if row else None
 
         if max_ms is None:
-            failures.append(f"{chk.name}: max({chk.ts_ms_col}) is NULL in {chk.table_fq}")
+            failures.append(
+                f"{chk.name}: max({chk.ts_ms_col}) is NULL in {chk.table_fq}"
+            )
             results.append((chk.name, "NULL", None, chk.max_lag_seconds, "FAIL"))
             continue
 
@@ -138,7 +145,15 @@ def run_data_health() -> None:
         status = "OK" if lag <= chk.max_lag_seconds else "FAIL"
 
         # value печатаем так, чтобы видно было и ms и iso
-        results.append((chk.name, f"{max_ms} -> {max_ts.isoformat()}", int(lag), chk.max_lag_seconds, status))
+        results.append(
+            (
+                chk.name,
+                f"{max_ms} -> {max_ts.isoformat()}",
+                int(lag),
+                chk.max_lag_seconds,
+                status,
+            )
+        )
 
         if status == "FAIL":
             failures.append(
@@ -172,14 +187,26 @@ def run_data_health() -> None:
         results.append(("orderbook_gap_1h", "NULL", None, max_gap_threshold_ms, "FAIL"))
     else:
         status = "OK" if max_gap_ms <= max_gap_threshold_ms else "FAIL"
-        results.append(("orderbook_gap_1h", f"gaps_cnt={gaps_cnt}", max_gap_ms, max_gap_threshold_ms, status))
+        results.append(
+            (
+                "orderbook_gap_1h",
+                f"gaps_cnt={gaps_cnt}",
+                max_gap_ms,
+                max_gap_threshold_ms,
+                status,
+            )
+        )
         if status == "FAIL":
-            failures.append(f"orderbook_gap_1h: max_gap_ms={max_gap_ms} > {max_gap_threshold_ms}ms")
+            failures.append(
+                f"orderbook_gap_1h: max_gap_ms={max_gap_ms} > {max_gap_threshold_ms}ms"
+            )
 
     # 5) отчёт
     print(f"[okx_data_health_5m] now_utc={now.isoformat()} db={dbname}")
     for r in results:
-        print(f"[health] name={r[0]} value={r[1]} lag={r[2]} threshold={r[3]} status={r[4]}")
+        print(
+            f"[health] name={r[0]} value={r[1]} lag={r[2]} threshold={r[3]} status={r[4]}"
+        )
 
     # 6) итог
     if failures:

@@ -24,7 +24,7 @@ from okx.common.settings import DEFAULT_ARGS, TAGS_HEALTH
 def okx_health_checks():
     """
     Simple health check DAG.
-    
+
     Verifies that:
     - Airflow scheduler is running
     - DAGs are being picked up
@@ -38,12 +38,12 @@ def okx_health_checks():
         from datetime import datetime, timezone
 
         logger = logging.getLogger(__name__)
-        
+
         current_time = datetime.now(timezone.utc).isoformat()
         message = f"OKX pipeline alive at {current_time}"
-        
+
         logger.info(message)
-        
+
         return message
 
     health_check()
@@ -51,5 +51,3 @@ def okx_health_checks():
 
 # Instantiate the DAG
 okx_health_checks()
-
-
