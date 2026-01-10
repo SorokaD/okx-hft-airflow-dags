@@ -175,9 +175,18 @@ def _sql_health_one(spec: EntitySpec) -> str:
       WHERE r.{spec.raw_ingest_ms_col} >= p.now_ms - {lookback_ms}::bigint
       GROUP BY 1
     ),
+    raw_gap_base AS (
+    SELECT
+        b_ms,
+        (b_ms - LAG(b_ms) OVER (ORDER BY b_ms)) AS gap_ms
+    FROM raw_buckets
+    ),
     raw_gap AS (
-      SELECT COALESCE(MAX((b_ms - LAG(b_ms) OVER (ORDER BY b_ms)) / 1000), 0)::int AS raw_max_gap_1h_sec
-      FROM raw_buckets
+    SELECT
+        COALESCE(MAX(gap_ms / 1000), 0)::int AS raw_max_gap_1h_sec
+    FROM raw_gap_base
+    ),
+
     ),
     raw_final AS (
       SELECT
@@ -212,9 +221,16 @@ def _sql_health_one(spec: EntitySpec) -> str:
       WHERE c.{spec.core_ts_ingest_col} >= now() - interval '{lookback_interval}'
       GROUP BY 1
     ),
+    core_gap_base AS (
+    SELECT
+        b,
+        (b - LAG(b) OVER (ORDER BY b)) AS gap
+    FROM core_buckets
+    ),
     core_gap AS (
-      SELECT COALESCE(MAX(EXTRACT(EPOCH FROM (b - LAG(b) OVER (ORDER BY b)))), 0)::int AS core_max_gap_1h_sec
-      FROM core_buckets
+    SELECT
+        COALESCE(MAX(EXTRACT(EPOCH FROM gap)), 0)::int AS core_max_gap_1h_sec
+    FROM core_gap_base
     ),
     core_final AS (
       SELECT
