@@ -341,53 +341,7 @@ def run_health() -> None:
     # Ensure mart tables exist (optional safety)
     hook.run(
         """
-        CREATE SCHEMA IF NOT EXISTS okx_mart;
-
-        CREATE TABLE IF NOT EXISTS okx_mart.health_now (
-          entity                 text PRIMARY KEY,
-          ts_check               timestamptz NOT NULL,
-
-          raw_max_ingest_ms       bigint,
-          raw_ingest_lag_sec      int,
-          raw_rows_5m             bigint,
-          raw_max_gap_1h_sec      int,
-
-          core_max_ts_ingest      timestamptz,
-          core_ingest_lag_sec     int,
-          core_rows_5m            bigint,
-          core_max_gap_1h_sec     int,
-
-          raw_core_lag_ms         bigint,
-
-          status                  text NOT NULL,
-          details                 text
-        );
-
-        CREATE TABLE IF NOT EXISTS okx_mart.health_history_1m (
-          ts_check               timestamptz NOT NULL,
-          entity                 text NOT NULL,
-
-          raw_max_ingest_ms       bigint,
-          raw_ingest_lag_sec      int,
-          raw_rows_5m             bigint,
-          raw_max_gap_1h_sec      int,
-
-          core_max_ts_ingest      timestamptz,
-          core_ingest_lag_sec     int,
-          core_rows_5m            bigint,
-          core_max_gap_1h_sec     int,
-
-          raw_core_lag_ms         bigint,
-
-          status                  text NOT NULL,
-          details                 text
-        );
-
-        CREATE INDEX IF NOT EXISTS health_history_1m_ts_check_idx
-        ON okx_mart.health_history_1m (ts_check DESC);
-
-        CREATE INDEX IF NOT EXISTS health_history_1m_entity_ts_idx
-        ON okx_mart.health_history_1m (entity, ts_check DESC);
+        SELECT 1;
         """
     )
 
