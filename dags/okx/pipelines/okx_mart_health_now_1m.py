@@ -47,12 +47,12 @@ class HealthCfg:
     warn_core_gap_sec: int = 120
     crit_core_gap_sec: int = 600
 
-    warn_raw_core_lag_ms: int = 60_000     # 1 min
-    crit_raw_core_lag_ms: int = 300_000    # 5 min
+    warn_raw_core_lag_ms: int = 60_000  # 1 min
+    crit_raw_core_lag_ms: int = 300_000  # 5 min
 
     # windows
-    gap_lookback_hours: int = 2            # minutes-bucket gap calc over last N hours
-    rows_window_minutes: int = 5           # rows_5m
+    gap_lookback_hours: int = 2  # minutes-bucket gap calc over last N hours
+    rows_window_minutes: int = 5  # rows_5m
 
 
 CFG = HealthCfg()
@@ -135,13 +135,6 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
 
 
 def _sql_health_one(spec: EntitySpec) -> str:
-    # We compute gap on "minute buckets" to keep it cheap.
-    # For raw(ms): bucket_ms = floor(ts_ingest_ms/60000)*60000
-    # For core(ts): time_bucket('1 minute', ts_ingest)
-    #
-    # We also write:
-    # - okx_mart.health_history_1m (append)
-    # - okx_mart.health_now (upsert by entity)
     lookback_ms = CFG.gap_lookback_hours * 60 * 60 * 1000
     rows_window_ms = CFG.rows_window_minutes * 60 * 1000
     lookback_interval = f"{CFG.gap_lookback_hours} hours"
@@ -176,17 +169,15 @@ def _sql_health_one(spec: EntitySpec) -> str:
       GROUP BY 1
     ),
     raw_gap_base AS (
-    SELECT
+      SELECT
         b_ms,
         (b_ms - LAG(b_ms) OVER (ORDER BY b_ms)) AS gap_ms
-    FROM raw_buckets
+      FROM raw_buckets
     ),
     raw_gap AS (
-    SELECT
+      SELECT
         COALESCE(MAX(gap_ms / 1000), 0)::int AS raw_max_gap_1h_sec
-    FROM raw_gap_base
-    ),
-
+      FROM raw_gap_base
     ),
     raw_final AS (
       SELECT
@@ -222,15 +213,15 @@ def _sql_health_one(spec: EntitySpec) -> str:
       GROUP BY 1
     ),
     core_gap_base AS (
-    SELECT
+      SELECT
         b,
         (b - LAG(b) OVER (ORDER BY b)) AS gap
-    FROM core_buckets
+      FROM core_buckets
     ),
     core_gap AS (
-    SELECT
+      SELECT
         COALESCE(MAX(EXTRACT(EPOCH FROM gap)), 0)::int AS core_max_gap_1h_sec
-    FROM core_gap_base
+      FROM core_gap_base
     ),
     core_final AS (
       SELECT
@@ -363,7 +354,9 @@ def run_health() -> None:
 
     for spec in ENTITIES:
         hook.run(_sql_health_one(spec))
-        print(f"[{DAG_ID}] now_utc={now.isoformat()} db={dbname} entity={spec.name} -> ok")
+        print(
+            f"[{DAG_ID}] now_utc={now.isoformat()} db={dbname} entity={spec.name} -> ok"
+        )
 
 
 # ============================================================
