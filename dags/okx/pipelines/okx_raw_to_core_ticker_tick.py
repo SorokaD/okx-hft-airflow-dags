@@ -14,16 +14,13 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 # ============================================================
 
 CONN_ID = "timescaledb"
-DB_NAME_EXPECTED = "okx_hft"  # самопроверка, чтобы не залить "не туда"
+DB_NAME_EXPECTED = "okx_hft"
 
-# DAG identity
 DAG_ID = "okx_raw_to_core_ticker_tick"
 SCHEDULE = "0 */6 * * *"  # каждые 6 часов
 
-# Tags (единый набор)
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "tickers"]
 
-# SQL basics
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
 
@@ -34,20 +31,29 @@ SQL_CURRENT_DB = "SELECT current_database();"
 
 @dataclass(frozen=True)
 class EtlConfig:
-    # tables
-    raw_table_fq: str = "okx_raw.tickers"             # schema.table
-    core_table_fq: str = "okx_core.fact_ticker_tick"  # schema.table
+    raw_table_fq: str = "okx_raw.tickers"
+    core_table_fq: str = "okx_core.fact_ticker_tick"
 
-    # window settings
-    window_hours: int = 6            # сколько часов грузим за запуск
-    step_minutes: int = 10           # размер под-окна (100k/10мин у тебя — отлично)
-    overlap_minutes: int = 2          # небольшой overlap для безопасности (задержки/перестановки)
-                                   # дедуп делаем PK/ON CONFLICT
+    # --- MODE SWITCH ---
+    # "rolling"  -> грузим последние window_hours (поддержка)
+    # "backfill" -> догоняем от watermark в core до now (но ограниченно)
+    mode: str = "backfill"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
+
+    # rolling window
+    window_hours: int = 6
+
+    # backfill controls
+    max_windows_per_run: int = 72  # 72*10min = 12 часов данных за 1 запуск
+
+    # batching by time
+    step_minutes: int = 10
+    overlap_minutes: int = 2
 
     # safety/ops
     execution_timeout_sec: int = 2 * 60 * 60  # 2 часа
     retries: int = 1
     retry_delay_sec: int = 120
+
 
 CFG = EtlConfig()
 
@@ -60,7 +66,6 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def _floor_to_minute(dt: datetime) -> datetime:
-    # чтобы окна были “ровные” и повторяемые
     return dt.replace(second=0, microsecond=0)
 
 def _ms(dt: datetime) -> int:
@@ -81,21 +86,33 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
         )
     return dbname or "UNKNOWN"
 
-def _window_bounds(now: datetime) -> Tuple[datetime, datetime]:
-    """
-    Основное окно: [to - window_hours, to)
-    + overlap назад, чтобы не терять поздние/задержанные записи.
-    """
+def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
+    # дешево, потому что у тебя есть индекс по ts_ingest в core
+    sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
+    row = hook.get_first(sql)
+    return row[0] if row and row[0] is not None else None
+
+def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
-    from_dt = to_dt - timedelta(hours=CFG.window_hours)
-    from_dt = from_dt - timedelta(minutes=CFG.overlap_minutes)
+    from_dt = to_dt - timedelta(hours=CFG.window_hours) - timedelta(minutes=CFG.overlap_minutes)
+    return from_dt, to_dt
+
+def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
+    to_dt = _floor_to_minute(now)
+
+    wm = _get_core_watermark_dt(hook)
+    if wm is None:
+        # если core пустой — начинаем как rolling (или можешь поставить “с начала времен” вручную)
+        from_dt = to_dt - timedelta(hours=CFG.window_hours)
+    else:
+        # стартуем от max(ts_ingest) в core минус overlap
+        from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
+
+    # тоже выровняем к минуте
+    from_dt = _floor_to_minute(from_dt)
     return from_dt, to_dt
 
 def _sql_insert_window(from_ms: int, to_ms: int) -> str:
-    """
-    Оконная загрузка без ORDER BY/LIMIT (без индекса это критично).
-    Вставляем только нужные поля. Возвращаем число вставленных строк.
-    """
     return f"""
     WITH ins AS (
       INSERT INTO {CFG.core_table_fq}
@@ -137,17 +154,9 @@ def _sql_insert_window(from_ms: int, to_ms: int) -> str:
     SELECT count(*)::bigint AS inserted_rows FROM ins;
     """
 
-def _log_run(*, dag_id: str, dbname: str, now: datetime, from_dt: datetime, to_dt: datetime,
-             step_minutes: int, windows: int, inserted_total: int) -> None:
-    print(
-        f"[{dag_id}] now_utc={now.isoformat()} db={dbname} "
-        f"window=[{from_dt.isoformat()}..{to_dt.isoformat()}) "
-        f"step_min={step_minutes} windows={windows} inserted_total={inserted_total}"
-    )
-
 
 # ============================================================
-# 3) Main callable (single responsibility: sync)
+# 3) Main callable
 # ============================================================
 
 def run_sync() -> None:
@@ -155,14 +164,26 @@ def run_sync() -> None:
     dbname = _db_sanity_checks(hook)
 
     now = _now_utc()
-    from_dt, to_dt = _window_bounds(now)
+
+    if CFG.mode not in ("rolling", "backfill"):
+        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+
+    if CFG.mode == "rolling":
+        from_dt, to_dt = _window_bounds_rolling(now)
+        windows_budget = 10**9  # без ограничения
+    else:
+        from_dt, to_dt = _window_bounds_backfill(hook, now)
+        windows_budget = CFG.max_windows_per_run  # ограничение на один запуск
 
     step = timedelta(minutes=CFG.step_minutes)
     t = from_dt
-    inserted_total = 0
-    windows = 0
 
-    while t < to_dt:
+    inserted_total = 0
+    windows_done = 0
+
+    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
+
+    while t < to_dt and windows_done < windows_budget:
         w_from = t
         w_to = min(t + step, to_dt)
 
@@ -171,25 +192,17 @@ def run_sync() -> None:
         inserted_rows = int(row[0]) if row and row[0] is not None else 0
 
         inserted_total += inserted_rows
-        windows += 1
+        windows_done += 1
 
-        # лёгкий лог по каждому окну (можно убрать если шумно)
-        print(
-            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) "
-            f"inserted={inserted_rows}"
-        )
+        print(f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
 
         t = w_to
 
-    _log_run(
-        dag_id=DAG_ID,
-        dbname=dbname,
-        now=now,
-        from_dt=from_dt,
-        to_dt=to_dt,
-        step_minutes=CFG.step_minutes,
-        windows=windows,
-        inserted_total=inserted_total,
+    # в backfill режиме полезно понимать: мы догнали или нет
+    remaining = to_dt - t
+    print(
+        f"[{DAG_ID}] DONE mode={CFG.mode} windows_done={windows_done} inserted_total={inserted_total} "
+        f"stopped_at={t.isoformat()} remaining={remaining}"
     )
 
 
@@ -206,7 +219,7 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="OKX ETL: windowed raw->core for tickers (no ORDER BY/LIMIT; PK-dedup via ON CONFLICT)",
+    description="OKX ETL: windowed raw->core for tickers (rolling/backfill; PK-dedup via ON CONFLICT)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
