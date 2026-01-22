@@ -17,7 +17,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_ticker_tick"
-SCHEDULE = "0 */6 * * *"  # каждые 6 часов
+SCHEDULE = "0 0,6,12,18 * * *"  # 00:00, 06:00, 12:00, 18:00 UTC
 
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "tickers"]
 
@@ -37,7 +37,7 @@ class EtlConfig:
     # --- MODE SWITCH ---
     # "rolling"  -> грузим последние window_hours (поддержка)
     # "backfill" -> догоняем от watermark в core до now (но ограниченно)
-    mode: str = "backfill"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
+    mode: str = "rolling"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
 
     # rolling window
     window_hours: int = 6
