@@ -16,10 +16,10 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
-DAG_ID = "okx_core_orderbook_update_level"
+DAG_ID = "okx_raw_to_core_orderbook_updates"
 SCHEDULE = "0 0,6,12,18 * * *"  # каждые 6 часов UTC
 
-TAGS = ["okx", "etl", "core", "timescaledb", "orderbook"]
+TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "orderbook"]
 
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
@@ -31,15 +31,13 @@ SQL_CURRENT_DB = "SELECT current_database();"
 
 @dataclass(frozen=True)
 class EtlConfig:
-    # sources/targets
-    src_table_fq: str = "okx_core.fact_orderbook_update"
-    dst_table_fq: str = "okx_core.fact_orderbook_update_level"
-
-    # explode params
-    top_n: int = 20
+    raw_table_fq: str = "okx_raw.orderbook_updates"
+    core_table_fq: str = "okx_core.fact_orderbook_update"
 
     # --- MODE SWITCH ---
-    mode: str = "rolling"  # "rolling" | "backfill"
+    # "rolling"  -> грузим последние window_hours (поддержка)
+    # "backfill" -> догоняем от watermark в core до now (но ограниченно)
+    mode: str = "backfill"  # <<< переключаешь тут
 
     # rolling window
     window_hours: int = 6
@@ -70,6 +68,11 @@ def _now_utc() -> datetime:
 def _floor_to_minute(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
 
+def _ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
 def _db_sanity_checks(hook: PostgresHook) -> str:
     v = hook.get_first(SQL_SELECT_1)
     if not v or v[0] != 1:
@@ -83,9 +86,9 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
         )
     return dbname or "UNKNOWN"
 
-def _get_dst_watermark_dt(hook: PostgresHook) -> datetime | None:
-    # критично чтобы на dst был индекс по ts_ingest (иначе max(ts_ingest) будет боль)
-    sql = f"SELECT max(ts_ingest) FROM {CFG.dst_table_fq};"
+def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
+    # дешево, если есть индекс по fact_orderbook_update(ts_ingest)
+    sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
     row = hook.get_first(sql)
     return row[0] if row and row[0] is not None else None
 
@@ -97,7 +100,7 @@ def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
 def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
 
-    wm = _get_dst_watermark_dt(hook)
+    wm = _get_core_watermark_dt(hook)
     if wm is None:
         from_dt = to_dt - timedelta(hours=CFG.window_hours)
     else:
@@ -105,56 +108,30 @@ def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime
 
     return _floor_to_minute(from_dt), to_dt
 
-def _sql_upsert_levels_window(from_dt: datetime, to_dt: datetime) -> str:
-    # NB: тут тяжелое место — jsonb_array_elements + row_number.
-    # Мы режем по времени ts_ingest, чтобы запрос был ограниченный и предсказуемый.
+def _sql_upsert_window(from_ms: int, to_ms: int) -> str:
+    # !!! IMPORTANT !!!
+    # orderbook_update: ты выбрал стратегию "освежать payload" => DO UPDATE.
+    # В backfill это может быть тяжело, но зато получаем корректный checksum/deltas.
     return f"""
-    WITH params AS (
+    WITH ins AS (
+      INSERT INTO {CFG.core_table_fq}
+        (inst_id, ts_event, ts_ingest, bids_delta, asks_delta, checksum)
       SELECT
-        '{from_dt.isoformat()}'::timestamptz AS v_from,
-        '{to_dt.isoformat()}'::timestamptz AS v_to
-    ),
-    batch AS (
-      SELECT
-        inst_id, ts_event, ts_ingest, bids_delta, asks_delta, checksum
-      FROM {CFG.src_table_fq}, params
-      WHERE ts_ingest >= params.v_from
-        AND ts_ingest <  params.v_to
-        AND (bids_delta IS NOT NULL OR asks_delta IS NOT NULL)
-    ),
-    lvl AS (
-      SELECT
-        b.inst_id, b.ts_event, b.ts_ingest,
-        z.side,
-        (z.elem->>'price')::float8 AS price_px,
-        (z.elem->>'size')::float8  AS size_qty,
-        b.checksum,
-        row_number() OVER (
-          PARTITION BY b.inst_id, b.ts_event, z.side
-          ORDER BY
-            CASE WHEN z.side='bid' THEN (z.elem->>'price')::float8 END DESC,
-            CASE WHEN z.side='ask' THEN (z.elem->>'price')::float8 END ASC
-        ) AS rn
-      FROM batch b
-      CROSS JOIN LATERAL (
-        SELECT 'bid'::text AS side, e AS elem
-        FROM jsonb_array_elements(COALESCE(b.bids_delta, '[]'::jsonb)) e
-        UNION ALL
-        SELECT 'ask'::text AS side, e AS elem
-        FROM jsonb_array_elements(COALESCE(b.asks_delta, '[]'::jsonb)) e
-      ) z
-    ),
-    ins AS (
-      INSERT INTO {CFG.dst_table_fq}
-        (inst_id, ts_event, ts_ingest, side, price_px, size_qty, checksum)
-      SELECT inst_id, ts_event, ts_ingest, side, price_px, size_qty, checksum
-      FROM lvl
-      WHERE rn <= {int(CFG.top_n)}
-      ON CONFLICT (inst_id, ts_event, side, price_px)
+        r.instid::text AS inst_id,
+        (to_timestamp(r.ts_event_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz AS ts_event,
+        (to_timestamp(r.ts_ingest_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz AS ts_ingest,
+        r.bids_delta,
+        r.asks_delta,
+        r.checksum
+      FROM {CFG.raw_table_fq} r
+      WHERE r.ts_ingest_ms >= {from_ms}
+        AND r.ts_ingest_ms <  {to_ms}
+      ON CONFLICT (inst_id, ts_event)
       DO UPDATE SET
-        size_qty = EXCLUDED.size_qty,
-        ts_ingest = EXCLUDED.ts_ingest,
-        checksum  = EXCLUDED.checksum
+        ts_ingest  = EXCLUDED.ts_ingest,
+        bids_delta = EXCLUDED.bids_delta,
+        asks_delta = EXCLUDED.asks_delta,
+        checksum   = EXCLUDED.checksum
       RETURNING 1
     )
     SELECT count(*)::bigint AS upserted_rows FROM ins;
@@ -187,13 +164,13 @@ def run_sync() -> None:
     upserted_total = 0
     windows_done = 0
 
-    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes} top_n={CFG.top_n}")
+    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
 
     while t < to_dt and windows_done < windows_budget:
         w_from = t
         w_to = min(t + step, to_dt)
 
-        sql = _sql_upsert_levels_window(w_from, w_to)
+        sql = _sql_upsert_window(_ms(w_from), _ms(w_to))
         row = hook.get_first(sql)
         upserted = int(row[0]) if row and row[0] is not None else 0
 
@@ -224,11 +201,11 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="OKX ETL: windowed core->core for orderbook levels (rolling/backfill; top-N)",
+    description="OKX ETL: windowed raw->core for orderbook updates (rolling/backfill; upsert by PK)",
     default_args=default_args,
-    start_date=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
-    catchup=False,      # важное отличие: мы сами делаем backfill режимом
+    catchup=False,
     max_active_runs=1,
     tags=TAGS,
 ) as dag:
