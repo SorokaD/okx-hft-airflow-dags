@@ -37,13 +37,13 @@ class EtlConfig:
     # --- MODE SWITCH ---
     # "rolling"  -> грузим последние window_hours (поддержка)
     # "backfill" -> догоняем от watermark в core до now (но ограниченно)
-    mode: str = "rolling"  # <<< переключаешь тут
+    mode: str = "backfill"  # <<< переключаешь тут
 
     # rolling window
     window_hours: int = 6
 
     # backfill controls
-    max_windows_per_run: int = 72  # 72*10min = 12 часов данных за 1 запуск
+    max_windows_per_run: int = 144  # 144*10min = 24 часов данных за 1 запуск
 
     # batching by time
     step_minutes: int = 10
