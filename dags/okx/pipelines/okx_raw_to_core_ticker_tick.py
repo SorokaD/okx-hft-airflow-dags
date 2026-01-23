@@ -65,13 +65,16 @@ CFG = EtlConfig()
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _floor_to_minute(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
+
 
 def _ms(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
 
 def _db_sanity_checks(hook: PostgresHook) -> str:
     v = hook.get_first(SQL_SELECT_1)
@@ -86,16 +89,20 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
         )
     return dbname or "UNKNOWN"
 
+
 def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
     # дешево, потому что у тебя есть индекс по ts_ingest в core
     sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
     row = hook.get_first(sql)
     return row[0] if row and row[0] is not None else None
 
+
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
-    from_dt = to_dt - timedelta(hours=CFG.window_hours) - timedelta(minutes=CFG.overlap_minutes)
+    from_dt = to_dt - timedelta(hours=CFG.window_hours) - \
+        timedelta(minutes=CFG.overlap_minutes)
     return from_dt, to_dt
+
 
 def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
@@ -111,6 +118,7 @@ def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime
     # тоже выровняем к минуте
     from_dt = _floor_to_minute(from_dt)
     return from_dt, to_dt
+
 
 def _sql_insert_window(from_ms: int, to_ms: int) -> str:
     return f"""
@@ -166,7 +174,8 @@ def run_sync() -> None:
     now = _now_utc()
 
     if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+        raise ValueError(
+            f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
 
     if CFG.mode == "rolling":
         from_dt, to_dt = _window_bounds_rolling(now)
@@ -194,7 +203,8 @@ def run_sync() -> None:
         inserted_total += inserted_rows
         windows_done += 1
 
-        print(f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
+        print(
+            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
 
         t = w_to
 

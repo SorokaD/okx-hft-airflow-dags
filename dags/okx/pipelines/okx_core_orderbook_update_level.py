@@ -17,7 +17,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_core_orderbook_update_level"
-SCHEDULE = "0 0,6,12,18 * * *"  # каждые 6 часов UTC
+SCHEDULE = "30 0,6,12,18 * * *"  # каждые 6 часов UTC
 
 TAGS = ["okx", "etl", "core", "timescaledb", "orderbook"]
 
@@ -39,7 +39,7 @@ class EtlConfig:
     top_n: int = 20
 
     # --- MODE SWITCH ---
-    mode: str = "rolling"  # "rolling" | "backfill"
+    mode: str = "backfill"  # "rolling" | "backfill"
 
     # rolling window
     window_hours: int = 6
