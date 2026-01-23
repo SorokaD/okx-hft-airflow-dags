@@ -17,7 +17,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_orderbook_updates"
-SCHEDULE = "0 0,6,12,18 * * *"  # каждые 6 часов UTC
+SCHEDULE = "15 0,6,12,18 * * *"  # каждые 6 часов UTC
 
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "orderbook"]
 
