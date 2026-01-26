@@ -46,7 +46,7 @@ class EtlConfig:
     max_windows_per_run: int = 144  # 144*10min = 24 часа данных за 1 запуск
 
     # batching by time
-    step_minutes: int = 10
+    step_minutes: int = 5
     overlap_minutes: int = 2
 
     # safety/ops
@@ -224,4 +224,5 @@ with DAG(
     PythonOperator(
         task_id="sync",
         python_callable=run_sync,
+        execution_timeout=timedelta(hours=6),
     )
