@@ -30,7 +30,7 @@ class EtlConfig:
 
     max_windows_per_run: int = 144  # 24 часа при step=10m
 
-    step_minutes: int = 10
+    step_minutes: int = 60
     overlap_minutes: int = 2
 
     execution_timeout_sec: int = 2 * 60 * 60
