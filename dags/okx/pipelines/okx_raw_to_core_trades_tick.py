@@ -2,50 +2,75 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 
+# ============================================================
+# 0) Project-wide constants (единый стандарт для всех DAG)
+# ============================================================
+
 CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
-DAG_ID = "okx__raw_to_core__trades_tick"
-SCHEDULE = "*/1 * * * *"
+DAG_ID = "okx_raw_to_core_trades_tick"
+SCHEDULE = "45 0,6,12,18 * * *"  # 00:00, 06:00, 12:00, 18:00 UTC
+
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "trades"]
 
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
 
 
+# ============================================================
+# 1) Config (всё настраиваемое — только тут)
+# ============================================================
+
 @dataclass(frozen=True)
 class EtlConfig:
     raw_table_fq: str = "okx_raw.trades"
     core_table_fq: str = "okx_core.fact_trades_tick"
 
-    core_wm_col: str = "ts_ingest"       # timestamptz
-    raw_wm_ms_col: str = "ts_ingest_ms"  # bigint epoch-ms
+    # --- MODE SWITCH ---
+    # "rolling"  -> грузим последние window_hours (поддержка)
+    # "backfill" -> догоняем от watermark в core до now (но ограниченно)
+    mode: str = "backfill"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
 
-    batch_size: int = 300_000
-    max_loops: int = 20
+    # rolling window
+    window_hours: int = 6
 
-    execution_timeout_sec: int = 180
-    retries: int = 2
-    retry_delay_sec: int = 60
+    # backfill controls
+    max_windows_per_run: int = 144  # 144*10min = 24 часа данных за 1 запуск
 
-    stop_if_inserted_zero: bool = False
+    # batching by time
+    step_minutes: int = 10
+    overlap_minutes: int = 2
+
+    # safety/ops
+    execution_timeout_sec: int = 2 * 60 * 60  # 2 часа
+    retries: int = 1
+    retry_delay_sec: int = 120
 
 
 CFG = EtlConfig()
 
 
+# ============================================================
+# 2) Helpers
+# ============================================================
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _ms_from_timestamptz(dt: datetime) -> int:
+def _floor_to_minute(dt: datetime) -> datetime:
+    return dt.replace(second=0, microsecond=0)
+
+
+def _ms(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
@@ -65,86 +90,119 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     return dbname or "UNKNOWN"
 
 
-def _get_core_watermark_ms(hook: PostgresHook) -> int:
-    sql = f"SELECT max({CFG.core_wm_col}) FROM {CFG.core_table_fq};"
+def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
+    sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
     row = hook.get_first(sql)
-    max_ts = row[0] if row else None
-    return 0 if max_ts is None else _ms_from_timestamptz(max_ts)
+    return row[0] if row and row[0] is not None else None
 
 
-def _sql_increment_once(last_ms: int) -> str:
+def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
+    to_dt = _floor_to_minute(now)
+    from_dt = to_dt - timedelta(hours=CFG.window_hours) - \
+        timedelta(minutes=CFG.overlap_minutes)
+    return from_dt, to_dt
+
+
+def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
+    to_dt = _floor_to_minute(now)
+
+    wm = _get_core_watermark_dt(hook)
+    if wm is None:
+        from_dt = to_dt - timedelta(hours=CFG.window_hours)
+    else:
+        from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
+
+    from_dt = _floor_to_minute(from_dt)
+    return from_dt, to_dt
+
+
+def _sql_insert_window(from_ms: int, to_ms: int) -> str:
+    # dedup по твоему unique index: (inst_id, ts_event, trade_id)
     return f"""
-    WITH batch AS (
-      SELECT *
-      FROM {CFG.raw_table_fq}
-      WHERE {CFG.raw_wm_ms_col} > {last_ms}
-      ORDER BY {CFG.raw_wm_ms_col}
-      LIMIT {CFG.batch_size}
-    ),
-    ins AS (
-      INSERT INTO {CFG.core_table_fq} (
-        inst_id,
-        ts_event,
-        ts_ingest,
-        trade_id,
-        trade_px,
-        trade_sz,
-        side
-      )
+    WITH ins AS (
+      INSERT INTO {CFG.core_table_fq}
+        (
+          inst_id,
+          ts_event,
+          ts_ingest,
+          trade_id,
+          trade_px,
+          trade_sz,
+          side
+        )
       SELECT
-        b.instid::text,
-        (to_timestamp(b.ts_event_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz,
-        (to_timestamp(b.ts_ingest_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz,
-        b.tradeid::text,
-        b.px,
-        b.sz,
-        b.side::text
-      FROM batch b
+          t.instid::text AS inst_id,
+          (to_timestamp(t.ts_event_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz AS ts_event,
+          (to_timestamp(t.ts_ingest_ms / 1000.0) AT TIME ZONE 'UTC')::timestamptz AS ts_ingest,
+          t.tradeid::text AS trade_id,
+          t.px::float8 AS trade_px,
+          t.sz::float8 AS trade_sz,
+          t.side::text AS side
+      FROM {CFG.raw_table_fq} t
+      WHERE t.ts_ingest_ms >= {from_ms}
+        AND t.ts_ingest_ms <  {to_ms}
       ON CONFLICT (inst_id, ts_event, trade_id) DO NOTHING
       RETURNING 1
     )
-    SELECT
-      COALESCE((SELECT max({CFG.raw_wm_ms_col}) FROM batch), {last_ms}) AS new_last_ms,
-      (SELECT count(*) FROM batch) AS batch_rows,
-      (SELECT count(*) FROM ins) AS inserted_rows;
+    SELECT count(*)::bigint AS inserted_rows FROM ins;
     """
 
+
+# ============================================================
+# 3) Main callable
+# ============================================================
 
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     dbname = _db_sanity_checks(hook)
 
     now = _now_utc()
-    last_ms = _get_core_watermark_ms(hook)
 
-    totals = {"batch": 0, "inserted": 0}
-    loops = 0
+    if CFG.mode not in ("rolling", "backfill"):
+        raise ValueError(
+            f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
 
-    while loops < CFG.max_loops:
-        loops += 1
+    if CFG.mode == "rolling":
+        from_dt, to_dt = _window_bounds_rolling(now)
+        windows_budget = 10**9  # без ограничения
+    else:
+        from_dt, to_dt = _window_bounds_backfill(hook, now)
+        windows_budget = CFG.max_windows_per_run
 
-        row = hook.get_first(_sql_increment_once(last_ms))
-        if not row:
-            raise RuntimeError("ETL query returned no result row")
+    step = timedelta(minutes=CFG.step_minutes)
+    t = from_dt
 
-        new_last_ms = int(row[0])
-        batch_rows = int(row[1]) if row[1] is not None else 0
-        inserted_rows = int(row[2]) if row[2] is not None else 0
+    inserted_total = 0
+    windows_done = 0
 
-        totals["batch"] += batch_rows
-        totals["inserted"] += inserted_rows
-        last_ms = new_last_ms
+    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
 
-        if batch_rows == 0:
-            break
-        if CFG.stop_if_inserted_zero and inserted_rows == 0:
-            break
+    while t < to_dt and windows_done < windows_budget:
+        w_from = t
+        w_to = min(t + step, to_dt)
 
+        sql = _sql_insert_window(_ms(w_from), _ms(w_to))
+        row = hook.get_first(sql)
+        inserted_rows = int(row[0]) if row and row[0] is not None else 0
+
+        inserted_total += inserted_rows
+        windows_done += 1
+
+        print(
+            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
+
+        t = w_to
+
+    remaining = to_dt - t
     print(
-        f"[{DAG_ID}] now_utc={now.isoformat()} db={dbname} loops={loops} "
-        f"batch={totals['batch']} inserted={totals['inserted']} last_ms={last_ms}"
+        f"[{DAG_ID}] DONE mode={CFG.mode} windows_done={windows_done} inserted_total={inserted_total} "
+        f"stopped_at={t.isoformat()} remaining={remaining}"
     )
 
+
+# ============================================================
+# 4) DAG definition
+# ============================================================
 
 default_args: dict[str, Any] = {
     "owner": "okx-data",
@@ -155,7 +213,7 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="OKX ETL: incremental raw->core for trades (batch, hypertable-safe ON CONFLICT)",
+    description="OKX ETL: windowed raw->core for trades (rolling/backfill; dedup via unique index ON CONFLICT)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
