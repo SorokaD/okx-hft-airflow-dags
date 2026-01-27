@@ -63,7 +63,8 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     row = hook.get_first(SQL_CURRENT_DB)
     dbname = row[0] if row else None
     if DB_NAME_EXPECTED and dbname != DB_NAME_EXPECTED:
-        raise RuntimeError(f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
+        raise RuntimeError(
+            f"Connected to unexpected database: {dbname} (expected {DB_NAME_EXPECTED})")
     return dbname or "UNKNOWN"
 
 
@@ -75,7 +76,8 @@ def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
-    from_dt = to_dt - timedelta(hours=CFG.window_hours) - timedelta(minutes=CFG.overlap_minutes)
+    from_dt = to_dt - timedelta(hours=CFG.window_hours) - \
+        timedelta(minutes=CFG.overlap_minutes)
     return from_dt, to_dt
 
 
@@ -155,7 +157,8 @@ def run_sync() -> None:
     now = _now_utc()
 
     if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+        raise ValueError(
+            f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
 
     if CFG.mode == "rolling":
         from_dt, to_dt = _window_bounds_rolling(now)
@@ -181,7 +184,8 @@ def run_sync() -> None:
 
         inserted_total += inserted_rows
         windows_done += 1
-        print(f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
+        print(
+            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
 
         t = w_to
 
