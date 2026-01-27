@@ -18,7 +18,7 @@ TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "index-tickers"]
 
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
-
+ 
 
 @dataclass(frozen=True)
 class EtlConfig:

@@ -11,7 +11,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
-
+ 
 DAG_ID = "okx_core_tick_to_core_funding_rate_event"
 SCHEDULE = "30 1,7,13,19 * * *"  # чуть после tick DAG
 TAGS = ["okx", "etl", "core", "timescaledb", "funding", "event"]

@@ -22,7 +22,7 @@ SCHEDULE = "30 0,6,12,18 * * *"  # каждые 6 часов UTC
 TAGS = ["okx", "etl", "core", "timescaledb", "orderbook"]
 
 SQL_SELECT_1 = "SELECT 1;"
-SQL_CURRENT_DB = "SELECT current_database();"
+SQL_CURRENT_DB = "SELECT current_database();" 
 
 
 # ============================================================

@@ -38,7 +38,7 @@ class EtlConfig:
     # "rolling"  -> грузим последние window_hours (поддержка)
     # "backfill" -> догоняем от watermark в core до now (но ограниченно)
     mode: str = "backfill"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
-
+ 
     # rolling window
     window_hours: int = 6
 

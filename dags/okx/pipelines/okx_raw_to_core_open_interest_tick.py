@@ -23,7 +23,7 @@ TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "open-interest"]
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
 
-
+ 
 # ============================================================
 # 1) Config (всё настраиваемое — только тут)
 # ============================================================

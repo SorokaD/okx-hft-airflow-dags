@@ -15,7 +15,7 @@ DB_NAME_EXPECTED = "okx_hft"
 DAG_ID = "okx_raw_to_core_funding_rate_tick"
 SCHEDULE = "15 1,7,13,19 * * *"  # как раньше (UTC)
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "funding"]
-
+  
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();"
 
