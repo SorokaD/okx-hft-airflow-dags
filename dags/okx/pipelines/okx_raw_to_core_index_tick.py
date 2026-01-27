@@ -13,7 +13,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_index_tick"
-SCHEDULE = "15 1,7,13,19 * * *"  # UTC
+SCHEDULE = "0 2,8,14,20 * * *"  # UTC
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "index-tickers"]
 
 SQL_SELECT_1 = "SELECT 1;"
