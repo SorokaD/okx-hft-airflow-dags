@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Tuple
+from typing import Any, Optional, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -17,7 +17,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_trades_tick"
-SCHEDULE = "45 0,6,12,18 * * *"  # 00:00, 06:00, 12:00, 18:00 UTC
+SCHEDULE = "45 0,6,12,18 * * *"  # 00:45, 06:45, 12:45, 18:45 UTC
 
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "trades"]
 
@@ -29,30 +29,40 @@ SQL_CURRENT_DB = "SELECT current_database();"
 # 1) Config (всё настраиваемое — только тут)
 # ============================================================
 
+
 @dataclass(frozen=True)
 class EtlConfig:
+    # sources/targets
     raw_table_fq: str = "okx_raw.trades"
     core_table_fq: str = "okx_core.fact_trades_tick"
 
     # --- MODE SWITCH ---
     # "rolling"  -> грузим последние window_hours (поддержка)
     # "backfill" -> догоняем от watermark в core до now (но ограниченно)
-    mode: str = "backfill"  # <<< ВОТ ТУТ ПЕРЕКЛЮЧАЕШЬ
+    mode: str = "backfill"  # <<< переключатель
 
     # rolling window
     window_hours: int = 6
 
-    # backfill controls
-    max_windows_per_run: int = 144  # 144*10min = 24 часа данных за 1 запуск
-
     # batching by time
-    step_minutes: int = 10
-    overlap_minutes: int = 2
+    # ВАЖНО: step_minutes и max_windows_per_run согласованы:
+    # step_minutes=5 => 288 окон = 24 часа данных за один запуск
+    step_minutes: int = 5
+    overlap_minutes: int = 1
 
-    # safety/ops
-    execution_timeout_sec: int = 2 * 60 * 60  # 2 часа
+    # backfill controls (ограничение "сколько догоняем" за запуск)
+    max_windows_per_run: int = 288  # 288*5min = 24h
+
+    # logging/ops
+    log_every_n_windows: int = 20  # печатаем прогресс раз в N окон
+    execution_timeout_sec: int = 6 * 60 * 60  # 6 часов
     retries: int = 1
     retry_delay_sec: int = 120
+
+    # optional: safety cap, чтобы не пытаться backfill "в вечность"
+    max_backfill_lookback_days: int = (
+        365  # если watermark очень старый, начнем не раньше now-365d
+    )
 
 
 CFG = EtlConfig()
@@ -61,6 +71,7 @@ CFG = EtlConfig()
 # ============================================================
 # 2) Helpers
 # ============================================================
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -90,34 +101,63 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     return dbname or "UNKNOWN"
 
 
-def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
-    sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
+def _get_core_watermark_dt(hook: PostgresHook) -> Optional[datetime]:
+    """
+    Быстрый watermark:
+    - вместо SELECT max(ts_ingest) (который может быть тяжелым),
+      используем ORDER BY ts_ingest DESC LIMIT 1.
+    - Очень желательно иметь индекс на (ts_ingest DESC) или хотя бы (ts_ingest).
+    """
+    sql = f"""
+    SELECT ts_ingest
+    FROM {CFG.core_table_fq}
+    ORDER BY ts_ingest DESC
+    LIMIT 1;
+    """
     row = hook.get_first(sql)
     return row[0] if row and row[0] is not None else None
 
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
-    from_dt = to_dt - timedelta(hours=CFG.window_hours) - \
-        timedelta(minutes=CFG.overlap_minutes)
+    from_dt = (
+        to_dt
+        - timedelta(hours=CFG.window_hours)
+        - timedelta(minutes=CFG.overlap_minutes)
+    )
+    from_dt = _floor_to_minute(from_dt)
     return from_dt, to_dt
 
 
-def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
+def _window_bounds_backfill(
+    hook: PostgresHook, now: datetime
+) -> Tuple[datetime, datetime]:
     to_dt = _floor_to_minute(now)
 
     wm = _get_core_watermark_dt(hook)
     if wm is None:
+        # если core пустой — грузим как rolling окно
         from_dt = to_dt - timedelta(hours=CFG.window_hours)
     else:
         from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
+
+    # safety cap: не начинаем слишком далеко в прошлое
+    min_from = to_dt - timedelta(days=CFG.max_backfill_lookback_days)
+    if from_dt < min_from:
+        from_dt = min_from
 
     from_dt = _floor_to_minute(from_dt)
     return from_dt, to_dt
 
 
 def _sql_insert_window(from_ms: int, to_ms: int) -> str:
-    # dedup по твоему unique index: (inst_id, ts_event, trade_id)
+    """
+    Вставка окна.
+    Важно:
+    - Фильтр по raw.ts_ingest_ms должен опираться на индекс на raw(ts_ingest_ms),
+      иначе будет тяжело.
+    - ON CONFLICT опирается на unique index/constraint на core (inst_id, ts_event, trade_id).
+    """
     return f"""
     WITH ins AS (
       INSERT INTO {CFG.core_table_fq}
@@ -148,9 +188,61 @@ def _sql_insert_window(from_ms: int, to_ms: int) -> str:
     """
 
 
+def _sql_check_required_indexes() -> str:
+    """
+    Ненавязчивая проверка индексов (быстро, без блокировок).
+    Мы не валим DAG, но печатаем предупреждения в лог.
+    """
+    return f"""
+    WITH idx AS (
+      SELECT
+        schemaname,
+        tablename,
+        indexname,
+        indexdef
+      FROM pg_indexes
+      WHERE (schemaname, tablename) IN (
+        ('okx_raw', 'trades'),
+        ('okx_core', 'fact_trades_tick')
+      )
+    )
+    SELECT
+      'raw_trades_has_ts_ingest_ms_idx' AS check_name,
+      EXISTS (
+        SELECT 1 FROM idx
+        WHERE schemaname='okx_raw'
+          AND tablename='trades'
+          AND indexdef ILIKE '%(ts_ingest_ms%'
+      ) AS ok
+    UNION ALL
+    SELECT
+      'core_fact_has_ts_ingest_idx' AS check_name,
+      EXISTS (
+        SELECT 1 FROM idx
+        WHERE schemaname='okx_core'
+          AND tablename='fact_trades_tick'
+          AND indexdef ILIKE '%(ts_ingest%'
+      ) AS ok
+    UNION ALL
+    SELECT
+      'core_fact_has_unique_inst_event_trade' AS check_name,
+      EXISTS (
+        SELECT 1 FROM idx
+        WHERE schemaname='okx_core'
+          AND tablename='fact_trades_tick'
+          AND (indexdef ILIKE '%UNIQUE%'
+               AND indexdef ILIKE '%(inst_id%'
+               AND indexdef ILIKE '%ts_event%'
+               AND indexdef ILIKE '%trade_id%')
+      ) AS ok
+    ;
+    """
+
+
 # ============================================================
 # 3) Main callable
 # ============================================================
+
 
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
@@ -159,8 +251,17 @@ def run_sync() -> None:
     now = _now_utc()
 
     if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(
-            f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+
+    # быстрая диагностика индексов
+    try:
+        rows = hook.get_records(_sql_check_required_indexes())
+        for check_name, ok in rows:
+            if not ok:
+                print(f"[{DAG_ID}] WARNING: index check failed: {check_name}=false")
+    except Exception as e:
+        # не критично — просто не мешаем загрузке
+        print(f"[{DAG_ID}] WARNING: index checks skipped due to error: {e!r}")
 
     if CFG.mode == "rolling":
         from_dt, to_dt = _window_bounds_rolling(now)
@@ -174,8 +275,14 @@ def run_sync() -> None:
 
     inserted_total = 0
     windows_done = 0
+    started_at = _now_utc()
 
-    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
+    print(
+        f"[{DAG_ID}] START mode={CFG.mode} db={dbname} "
+        f"window=[{from_dt.isoformat()}..{to_dt.isoformat()}) "
+        f"step_min={CFG.step_minutes} overlap_min={CFG.overlap_minutes} "
+        f"budget_windows={windows_budget}"
+    )
 
     while t < to_dt and windows_done < windows_budget:
         w_from = t
@@ -188,15 +295,26 @@ def run_sync() -> None:
         inserted_total += inserted_rows
         windows_done += 1
 
-        print(
-            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
+        # логирование не на каждое окно
+        if (
+            windows_done == 1
+            or (windows_done % CFG.log_every_n_windows == 0)
+            or w_to == to_dt
+        ):
+            elapsed = _now_utc() - started_at
+            print(
+                f"[{DAG_ID}] PROGRESS windows_done={windows_done} "
+                f"last_window=[{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows} "
+                f"inserted_total={inserted_total} elapsed={elapsed}"
+            )
 
         t = w_to
 
     remaining = to_dt - t
+    elapsed = _now_utc() - started_at
     print(
         f"[{DAG_ID}] DONE mode={CFG.mode} windows_done={windows_done} inserted_total={inserted_total} "
-        f"stopped_at={t.isoformat()} remaining={remaining}"
+        f"stopped_at={t.isoformat()} remaining={remaining} elapsed={elapsed}"
     )
 
 
@@ -213,7 +331,7 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="OKX ETL: windowed raw->core for trades (rolling/backfill; dedup via unique index ON CONFLICT)",
+    description="OKX ETL: windowed raw->core for trades (rolling/backfill; fast watermark; throttled logs)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
@@ -224,4 +342,5 @@ with DAG(
     PythonOperator(
         task_id="sync",
         python_callable=run_sync,
+        # оставляем один источник истины: timeout в default_args
     )
