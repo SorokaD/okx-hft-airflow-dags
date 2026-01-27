@@ -24,7 +24,7 @@ TAGS = ["okx", "etl", "core", "timescaledb", "orderbook"]
 SQL_SELECT_1 = "SELECT 1;"
 SQL_CURRENT_DB = "SELECT current_database();" 
 
-
+ 
 # ============================================================
 # 1) Config
 # ============================================================
