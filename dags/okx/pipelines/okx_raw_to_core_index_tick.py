@@ -101,9 +101,9 @@ def _get_raw_max_ts_ingest_ms(cursor) -> int | None:
     return int(row[0]) if row and row[0] is not None else None
 
 
-def _get_distinct_instids(cursor, where_sql: str) -> list[str]:
+def _get_distinct_instids(cursor, where_sql: str, alias: str) -> list[str]:
     cursor.execute(
-        f"SELECT DISTINCT instid FROM {CFG.raw_table_fq} WHERE {where_sql};"
+        f"SELECT DISTINCT {alias}.instid FROM {CFG.raw_table_fq} {alias} WHERE {where_sql};"
     )
     return [r[0] for r in cursor.fetchall() if r and r[0] is not None]
 
@@ -211,7 +211,7 @@ def run_sync() -> None:
         print(f"[{DAG_ID}] SKIP: raw empty or older than window raw_max_ms={raw_max_ms}")
         return
 
-    instids = _get_distinct_instids(cursor, where_sql)
+    instids = _get_distinct_instids(cursor, where_sql, "r")
     if CFG.max_instruments_per_run is not None:
         instids = instids[: CFG.max_instruments_per_run]
 
