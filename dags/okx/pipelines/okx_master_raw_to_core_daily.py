@@ -53,7 +53,7 @@ with DAG(
             reset_dag_run=True,
             poke_interval=60,
             allowed_states=["success"],
-            failed_states=["failed", "upstream_failed"],
+            failed_states=["failed"],
         )
         if prev is not None:
             prev >> task
