@@ -70,6 +70,11 @@ def _get_event_watermark_dt(hook: PostgresHook) -> datetime | None:
     row = hook.get_first(sql)
     return row[0] if row and row[0] is not None else None
 
+def _get_tick_max_ts_ingest(hook: PostgresHook) -> datetime | None:
+    sql = f"SELECT max(ts_ingest) FROM {CFG.tick_table_fq};"
+    row = hook.get_first(sql)
+    return row[0] if row and row[0] is not None else None
+
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _day_start_utc(now)
@@ -135,6 +140,15 @@ def run_sync() -> None:
     else:
         from_dt, to_dt = _window_bounds_backfill(hook, now)
         windows_budget = CFG.max_windows_per_run
+
+    # быстрый выход: если в ticks нет данных до окна
+    tick_max = _get_tick_max_ts_ingest(hook)
+    if tick_max is None or tick_max < from_dt:
+        print(
+            f"[{DAG_ID}] SKIP: tick empty or older than window "
+            f"tick_max={tick_max} window_from={from_dt.isoformat()}"
+        )
+        return
 
     step = timedelta(minutes=CFG.step_minutes)
     t = from_dt

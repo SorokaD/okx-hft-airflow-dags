@@ -123,6 +123,12 @@ def _get_core_watermark_dt(hook: PostgresHook) -> Optional[datetime]:
     return row[0] if row and row[0] is not None else None
 
 
+def _get_raw_max_ts_ingest_ms(hook: PostgresHook) -> int | None:
+    sql = f"SELECT max(ts_ingest_ms) FROM {CFG.raw_table_fq};"
+    row = hook.get_first(sql)
+    return int(row[0]) if row and row[0] is not None else None
+
+
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
     to_dt = _day_start_utc(now)
     from_dt = (
@@ -274,6 +280,15 @@ def run_sync() -> None:
     else:
         from_dt, to_dt = _window_bounds_backfill(hook, now)
         windows_budget = CFG.max_windows_per_run
+
+    # быстрый выход: если в raw нет данных до окна
+    raw_max_ms = _get_raw_max_ts_ingest_ms(hook)
+    if raw_max_ms is None or raw_max_ms < _ms(from_dt):
+        print(
+            f"[{DAG_ID}] SKIP: raw empty or older than window "
+            f"raw_max_ms={raw_max_ms} window_from_ms={_ms(from_dt)}"
+        )
+        return
 
     step = timedelta(minutes=CFG.step_minutes)
     t = from_dt
