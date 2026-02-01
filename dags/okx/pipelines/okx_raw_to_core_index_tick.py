@@ -13,7 +13,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_index_tick"
-SCHEDULE = "0 2,8,14,20 * * *"  # UTC
+SCHEDULE = None  # запускается мастер-DAG'ом раз в сутки (t-1)
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "index-tickers"]
 
 SQL_SELECT_1 = "SELECT 1;"
@@ -43,6 +43,11 @@ CFG = EtlConfig()
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def _day_start_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _floor_to_minute(dt: datetime) -> datetime:
@@ -75,17 +80,17 @@ def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
 
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
-    to_dt = _floor_to_minute(now)
+    to_dt = _day_start_utc(now)
     from_dt = to_dt - timedelta(hours=CFG.window_hours) - \
         timedelta(minutes=CFG.overlap_minutes)
     return from_dt, to_dt
 
 
 def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
-    to_dt = _floor_to_minute(now)
+    to_dt = _day_start_utc(now)
     wm = _get_core_watermark_dt(hook)
     if wm is None:
-        from_dt = to_dt - timedelta(hours=CFG.window_hours)
+        from_dt = to_dt - timedelta(days=1)
     else:
         from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
     return _floor_to_minute(from_dt), to_dt
