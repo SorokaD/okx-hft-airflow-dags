@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Tuple
+from typing import Any
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+from okx.common.etl_common import get_logical_run_date, log_diagnostics, day_start_utc
 
 
 CONN_ID = "timescaledb"
@@ -25,12 +27,10 @@ class EtlConfig:
     tick_table_fq: str = "okx_core.fact_funding_rate_tick"
     event_table_fq: str = "okx_core.fact_funding_rate_event"
 
-    mode: str = "backfill"
-    window_hours: int = 24  # события редкие, можно шире
-
-    max_windows_per_run: int = 144  # 24 часа при step=10m
-    step_minutes: int = 60
     overlap_minutes: int = 5
+
+    # statement timeout (ms)
+    statement_timeout_ms: int = 30 * 60 * 1000
 
     execution_timeout_sec: int = 2 * 60 * 60
     retries: int = 1
@@ -38,19 +38,6 @@ class EtlConfig:
 
 
 CFG = EtlConfig()
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def _day_start_utc(dt: datetime) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def _floor_to_minute(dt: datetime) -> datetime:
-    return dt.replace(second=0, microsecond=0)
 
 
 def _db_sanity_checks(hook: PostgresHook) -> str:
@@ -65,31 +52,17 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     return dbname or "UNKNOWN"
 
 
-def _get_event_watermark_dt(hook: PostgresHook) -> datetime | None:
+def _get_event_watermark_dt(cursor) -> datetime | None:
     sql = f"SELECT max(ts_ingest) FROM {CFG.event_table_fq};"
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return row[0] if row and row[0] is not None else None
 
-def _get_tick_max_ts_ingest(hook: PostgresHook) -> datetime | None:
+def _get_tick_max_ts_ingest(cursor) -> datetime | None:
     sql = f"SELECT max(ts_ingest) FROM {CFG.tick_table_fq};"
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return row[0] if row and row[0] is not None else None
-
-
-def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
-    to_dt = _day_start_utc(now)
-    from_dt = to_dt - timedelta(hours=CFG.window_hours) - timedelta(minutes=CFG.overlap_minutes)
-    return from_dt, to_dt
-
-
-def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime, datetime]:
-    to_dt = _day_start_utc(now)
-    wm = _get_event_watermark_dt(hook)
-    if wm is None:
-        from_dt = to_dt - timedelta(days=1)
-    else:
-        from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
-    return _floor_to_minute(from_dt), to_dt
 
 
 def _sql_insert_window(from_dt: datetime, to_dt: datetime) -> str:
@@ -129,48 +102,34 @@ def _sql_insert_window(from_dt: datetime, to_dt: datetime) -> str:
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     dbname = _db_sanity_checks(hook)
-    now = _now_utc()
 
-    if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+    conn = hook.get_conn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+    cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
+    log_diagnostics(cursor, [CFG.tick_table_fq, CFG.event_table_fq])
 
-    if CFG.mode == "rolling":
-        from_dt, to_dt = _window_bounds_rolling(now)
-        windows_budget = 10**9
-    else:
-        from_dt, to_dt = _window_bounds_backfill(hook, now)
-        windows_budget = CFG.max_windows_per_run
+    run_dt = get_logical_run_date()
+    to_dt = day_start_utc(run_dt)
 
-    # быстрый выход: если в ticks нет данных до окна
-    tick_max = _get_tick_max_ts_ingest(hook)
-    if tick_max is None or tick_max < from_dt:
+    wm = _get_event_watermark_dt(cursor)
+    from_dt = wm - timedelta(minutes=CFG.overlap_minutes) if wm else None
+
+    tick_max = _get_tick_max_ts_ingest(cursor)
+    if tick_max is None or (from_dt is not None and tick_max < from_dt):
         print(
             f"[{DAG_ID}] SKIP: tick empty or older than window "
-            f"tick_max={tick_max} window_from={from_dt.isoformat()}"
+            f"tick_max={tick_max} window_from={from_dt}"
         )
         return
 
-    step = timedelta(minutes=CFG.step_minutes)
-    t = from_dt
+    if from_dt is None:
+        from_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    inserted_total = 0
-    windows_done = 0
-
-    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
-
-    while t < to_dt and windows_done < windows_budget:
-        w_from = t
-        w_to = min(t + step, to_dt)
-
-        row = hook.get_first(_sql_insert_window(w_from, w_to))
-        inserted_rows = int(row[0]) if row and row[0] is not None else 0
-
-        inserted_total += inserted_rows
-        windows_done += 1
-        print(f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
-        t = w_to
-
-    print(f"[{DAG_ID}] DONE inserted_total={inserted_total} windows_done={windows_done} stopped_at={t.isoformat()}")
+    print(f"[{DAG_ID}] db={dbname} window=[{from_dt}..{to_dt})")
+    row = hook.get_first(_sql_insert_window(from_dt, to_dt))
+    inserted_rows = int(row[0]) if row and row[0] is not None else 0
+    print(f"[{DAG_ID}] DONE inserted_total={inserted_rows}")
 
 
 default_args: dict[str, Any] = {

@@ -38,7 +38,7 @@ with DAG(
     dag_id=MASTER_DAG_ID,
     description="OKX master DAG: sequential t-1 raw->core and dependent core->core loads",
     default_args=default_args,
-    start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    start_date=datetime(2026, 2, 1, tzinfo=timezone.utc),
     schedule=SCHEDULE,
     catchup=False,
     max_active_runs=1,
@@ -49,6 +49,7 @@ with DAG(
         task = TriggerDagRunOperator(
             task_id=f"run_{dag_id}",
             trigger_dag_id=dag_id,
+            conf={"logical_date": "{{ data_interval_end }}"},
             wait_for_completion=True,
             reset_dag_run=True,
             poke_interval=60,

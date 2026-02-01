@@ -103,6 +103,20 @@ Collector Node (217.216.73.20)
 Airflow **не участвует в real-time ingestion**,  
 он работает поверх уже записанных данных и контролирует их состояние.
 
+## Ingestion-based raw -> core (важно)
+
+Все raw→core DAG'и используют **ingestion-time** (ts_ingest/ts_ingest_ms), а не ts_event:
+
+- `to_dt` = начало суток UTC (00:00) для logical run-date
+- `from_dt` = max(ts_ingest) в okx_core (с небольшим overlap)
+- фильтрация только по `ts_ingest_ms`, без ограничений по `ts_event`
+- вставка идемпотентна через `ON CONFLICT DO NOTHING`
+
+Это гарантирует:
+- поздние данные не теряются
+- перезапуски безопасны
+- pipeline повторяем и предсказуем
+
 
 ## Структура репозитория
 

@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+from okx.common.etl_common import (
+    batch_iter,
+    day_start_utc,
+    get_logical_run_date,
+    log_diagnostics,
+    ms,
+)
 
 
 # ============================================================
@@ -64,6 +72,13 @@ class EtlConfig:
         365  # если watermark очень старый, начнем не раньше now-365d
     )
 
+    # batching by instrument
+    batch_size: int = 20
+    max_instruments_per_run: int | None = None
+
+    # statement timeout (ms)
+    statement_timeout_ms: int = 6 * 60 * 60 * 1000
+
 
 CFG = EtlConfig()
 
@@ -106,7 +121,7 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     return dbname or "UNKNOWN"
 
 
-def _get_core_watermark_dt(hook: PostgresHook) -> Optional[datetime]:
+def _get_core_watermark_dt(cursor) -> Optional[datetime]:
     """
     Быстрый watermark:
     - вместо SELECT max(ts_ingest) (который может быть тяжелым),
@@ -119,14 +134,23 @@ def _get_core_watermark_dt(hook: PostgresHook) -> Optional[datetime]:
     ORDER BY ts_ingest DESC
     LIMIT 1;
     """
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return row[0] if row and row[0] is not None else None
 
 
-def _get_raw_max_ts_ingest_ms(hook: PostgresHook) -> int | None:
+def _get_raw_max_ts_ingest_ms(cursor) -> int | None:
     sql = f"SELECT max(ts_ingest_ms) FROM {CFG.raw_table_fq};"
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return int(row[0]) if row and row[0] is not None else None
+
+
+def _get_distinct_instids(cursor, where_sql: str) -> list[str]:
+    cursor.execute(
+        f"SELECT DISTINCT instid FROM {CFG.raw_table_fq} WHERE {where_sql};"
+    )
+    return [r[0] for r in cursor.fetchall() if r and r[0] is not None]
 
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
@@ -161,7 +185,7 @@ def _window_bounds_backfill(
     return from_dt, to_dt
 
 
-def _sql_insert_window(from_ms: int, to_ms: int) -> str:
+def _sql_insert_window(where_sql: str, instids: Sequence[str] | None) -> tuple[str, dict | None]:
     """
     Вставка окна.
     Важно:
@@ -190,13 +214,13 @@ def _sql_insert_window(from_ms: int, to_ms: int) -> str:
           t.sz::float8 AS trade_sz,
           t.side::text AS side
       FROM {CFG.raw_table_fq} t
-      WHERE t.ts_ingest_ms >= {from_ms}
-        AND t.ts_ingest_ms <  {to_ms}
+      WHERE {where_sql}
+        {f"AND t.instid = ANY(%(instids)s)" if instids is not None else ""}
       ON CONFLICT (inst_id, ts_event, trade_id) DO NOTHING
       RETURNING 1
     )
     SELECT count(*)::bigint AS inserted_rows FROM ins;
-    """
+    """, ({"instids": list(instids)} if instids is not None else None)
 
 
 def _sql_check_required_indexes() -> str:
@@ -257,85 +281,63 @@ def _sql_check_required_indexes() -> str:
 
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
-    dbname = _db_sanity_checks(hook)
+    _db_sanity_checks(hook)
 
-    now = _now_utc()
-
-    if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+    conn = hook.get_conn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+    cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
+    log_diagnostics(cursor, [CFG.raw_table_fq, CFG.core_table_fq])
 
     # быстрая диагностика индексов
     try:
-        rows = hook.get_records(_sql_check_required_indexes())
+        cursor.execute(_sql_check_required_indexes())
+        rows = cursor.fetchall()
         for check_name, ok in rows:
             if not ok:
                 print(f"[{DAG_ID}] WARNING: index check failed: {check_name}=false")
     except Exception as e:
-        # не критично — просто не мешаем загрузке
         print(f"[{DAG_ID}] WARNING: index checks skipped due to error: {e!r}")
 
-    if CFG.mode == "rolling":
-        from_dt, to_dt = _window_bounds_rolling(now)
-        windows_budget = 10**9  # без ограничения
-    else:
-        from_dt, to_dt = _window_bounds_backfill(hook, now)
-        windows_budget = CFG.max_windows_per_run
+    run_dt = get_logical_run_date()
+    to_dt = day_start_utc(run_dt)
 
-    # быстрый выход: если в raw нет данных до окна
-    raw_max_ms = _get_raw_max_ts_ingest_ms(hook)
-    if raw_max_ms is None or raw_max_ms < _ms(from_dt):
-        print(
-            f"[{DAG_ID}] SKIP: raw empty or older than window "
-            f"raw_max_ms={raw_max_ms} window_from_ms={_ms(from_dt)}"
-        )
+    wm = _get_core_watermark_dt(cursor)
+    from_dt = wm - timedelta(minutes=CFG.overlap_minutes) if wm else None
+
+    to_ms = ms(to_dt)
+    where_sql = f"t.ts_ingest_ms < {to_ms}"
+    if from_dt is not None:
+        where_sql = f"t.ts_ingest_ms >= {ms(from_dt)} AND " + where_sql
+
+    raw_max_ms = _get_raw_max_ts_ingest_ms(cursor)
+    if raw_max_ms is None or (from_dt is not None and raw_max_ms < ms(from_dt)):
+        print(f"[{DAG_ID}] SKIP: raw empty or older than window raw_max_ms={raw_max_ms}")
         return
 
-    step = timedelta(minutes=CFG.step_minutes)
-    t = from_dt
+    instids = _get_distinct_instids(cursor, where_sql)
+    if CFG.max_instruments_per_run is not None:
+        instids = instids[: CFG.max_instruments_per_run]
 
     inserted_total = 0
-    windows_done = 0
-    started_at = _now_utc()
+    if not instids or len(instids) <= CFG.batch_size:
+        sql, params = _sql_insert_window(where_sql, None)
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        inserted_total = int(row[0]) if row and row[0] is not None else 0
+        print(f"[{DAG_ID}] inserted_total={inserted_total}")
+        return
 
-    print(
-        f"[{DAG_ID}] START mode={CFG.mode} db={dbname} "
-        f"window=[{from_dt.isoformat()}..{to_dt.isoformat()}) "
-        f"step_min={CFG.step_minutes} overlap_min={CFG.overlap_minutes} "
-        f"budget_windows={windows_budget}"
-    )
+    print(f"[{DAG_ID}] batching instid count={len(instids)} batch_size={CFG.batch_size}")
+    for batch in batch_iter(instids, CFG.batch_size):
+        sql, params = _sql_insert_window(where_sql, batch)
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        inserted = int(row[0]) if row and row[0] is not None else 0
+        inserted_total += inserted
+        print(f"[{DAG_ID}] batch inserted={inserted}")
 
-    while t < to_dt and windows_done < windows_budget:
-        w_from = t
-        w_to = min(t + step, to_dt)
-
-        sql = _sql_insert_window(_ms(w_from), _ms(w_to))
-        row = hook.get_first(sql)
-        inserted_rows = int(row[0]) if row and row[0] is not None else 0
-
-        inserted_total += inserted_rows
-        windows_done += 1
-
-        # логирование не на каждое окно
-        if (
-            windows_done == 1
-            or (windows_done % CFG.log_every_n_windows == 0)
-            or w_to == to_dt
-        ):
-            elapsed = _now_utc() - started_at
-            print(
-                f"[{DAG_ID}] PROGRESS windows_done={windows_done} "
-                f"last_window=[{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows} "
-                f"inserted_total={inserted_total} elapsed={elapsed}"
-            )
-
-        t = w_to
-
-    remaining = to_dt - t
-    elapsed = _now_utc() - started_at
-    print(
-        f"[{DAG_ID}] DONE mode={CFG.mode} windows_done={windows_done} inserted_total={inserted_total} "
-        f"stopped_at={t.isoformat()} remaining={remaining} elapsed={elapsed}"
-    )
+    print(f"[{DAG_ID}] DONE inserted_total={inserted_total}")
 
 
 # ============================================================

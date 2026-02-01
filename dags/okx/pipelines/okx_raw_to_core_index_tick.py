@@ -2,11 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+from okx.common.etl_common import (
+    batch_iter,
+    day_start_utc,
+    get_logical_run_date,
+    log_diagnostics,
+    ms,
+)
 
 
 CONN_ID = "timescaledb"
@@ -32,6 +40,13 @@ class EtlConfig:
 
     step_minutes: int = 10
     overlap_minutes: int = 2
+
+    # batching by instrument
+    batch_size: int = 20
+    max_instruments_per_run: int | None = None
+
+    # statement timeout (ms)
+    statement_timeout_ms: int = 30 * 60 * 1000
 
     execution_timeout_sec: int = 2 * 60 * 60
     retries: int = 1
@@ -73,15 +88,24 @@ def _db_sanity_checks(hook: PostgresHook) -> str:
     return dbname or "UNKNOWN"
 
 
-def _get_core_watermark_dt(hook: PostgresHook) -> datetime | None:
+def _get_core_watermark_dt(cursor) -> datetime | None:
     sql = f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};"
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return row[0] if row and row[0] is not None else None
 
-def _get_raw_max_ts_ingest_ms(hook: PostgresHook) -> int | None:
+def _get_raw_max_ts_ingest_ms(cursor) -> int | None:
     sql = f"SELECT max(ts_ingest_ms) FROM {CFG.raw_table_fq};"
-    row = hook.get_first(sql)
+    cursor.execute(sql)
+    row = cursor.fetchone()
     return int(row[0]) if row and row[0] is not None else None
+
+
+def _get_distinct_instids(cursor, where_sql: str) -> list[str]:
+    cursor.execute(
+        f"SELECT DISTINCT instid FROM {CFG.raw_table_fq} WHERE {where_sql};"
+    )
+    return [r[0] for r in cursor.fetchall() if r and r[0] is not None]
 
 
 def _window_bounds_rolling(now: datetime) -> Tuple[datetime, datetime]:
@@ -101,7 +125,7 @@ def _window_bounds_backfill(hook: PostgresHook, now: datetime) -> Tuple[datetime
     return _floor_to_minute(from_dt), to_dt
 
 
-def _sql_insert_window(from_ms: int, to_ms: int) -> str:
+def _sql_insert_window(where_sql: str, instids: Sequence[str] | None) -> tuple[str, dict | None]:
     """
     RAW okx_raw.index_tickers:
       instid varchar(50)
@@ -152,67 +176,64 @@ def _sql_insert_window(from_ms: int, to_ms: int) -> str:
         r.sodutc0::float8 AS sod_utc0_px,
         r.sodutc8::float8 AS sod_utc8_px
       FROM {CFG.raw_table_fq} r
-      WHERE r.ts_ingest_ms >= {from_ms}
-        AND r.ts_ingest_ms <  {to_ms}
+      WHERE {where_sql}
+        {f"AND r.instid = ANY(%(instids)s)" if instids is not None else ""}
       ON CONFLICT (inst_id, ts_event) DO NOTHING
       RETURNING 1
     )
     SELECT count(*)::bigint AS inserted_rows FROM ins;
-    """
+    """, ({"instids": list(instids)} if instids is not None else None)
 
 
 def run_sync() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
-    dbname = _db_sanity_checks(hook)
-    now = _now_utc()
+    _db_sanity_checks(hook)
 
-    if CFG.mode not in ("rolling", "backfill"):
-        raise ValueError(
-            f"CFG.mode must be 'rolling' or 'backfill', got: {CFG.mode}")
+    conn = hook.get_conn()
+    conn.autocommit = True
+    cursor = conn.cursor()
+    cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
+    log_diagnostics(cursor, [CFG.raw_table_fq, CFG.core_table_fq])
 
-    if CFG.mode == "rolling":
-        from_dt, to_dt = _window_bounds_rolling(now)
-        windows_budget = 10**9
-    else:
-        from_dt, to_dt = _window_bounds_backfill(hook, now)
-        windows_budget = CFG.max_windows_per_run
+    run_dt = get_logical_run_date()
+    to_dt = day_start_utc(run_dt)
 
-    # быстрый выход: если в raw нет данных до окна
-    raw_max_ms = _get_raw_max_ts_ingest_ms(hook)
-    if raw_max_ms is None or raw_max_ms < _ms(from_dt):
-        print(
-            f"[{DAG_ID}] SKIP: raw empty or older than window "
-            f"raw_max_ms={raw_max_ms} window_from_ms={_ms(from_dt)}"
-        )
+    wm = _get_core_watermark_dt(cursor)
+    from_dt = wm - timedelta(minutes=CFG.overlap_minutes) if wm else None
+
+    to_ms = ms(to_dt)
+    where_sql = f"r.ts_ingest_ms < {to_ms}"
+    if from_dt is not None:
+        where_sql = f"r.ts_ingest_ms >= {ms(from_dt)} AND " + where_sql
+
+    raw_max_ms = _get_raw_max_ts_ingest_ms(cursor)
+    if raw_max_ms is None or (from_dt is not None and raw_max_ms < ms(from_dt)):
+        print(f"[{DAG_ID}] SKIP: raw empty or older than window raw_max_ms={raw_max_ms}")
         return
 
-    step = timedelta(minutes=CFG.step_minutes)
-    t = from_dt
+    instids = _get_distinct_instids(cursor, where_sql)
+    if CFG.max_instruments_per_run is not None:
+        instids = instids[: CFG.max_instruments_per_run]
 
     inserted_total = 0
-    windows_done = 0
+    if not instids or len(instids) <= CFG.batch_size:
+        sql, params = _sql_insert_window(where_sql, None)
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        inserted_total = int(row[0]) if row and row[0] is not None else 0
+        print(f"[{DAG_ID}] inserted_total={inserted_total}")
+        return
 
-    print(f"[{DAG_ID}] mode={CFG.mode} db={dbname} window=[{from_dt}..{to_dt}) step_min={CFG.step_minutes}")
+    print(f"[{DAG_ID}] batching instid count={len(instids)} batch_size={CFG.batch_size}")
+    for batch in batch_iter(instids, CFG.batch_size):
+        sql, params = _sql_insert_window(where_sql, batch)
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        inserted = int(row[0]) if row and row[0] is not None else 0
+        inserted_total += inserted
+        print(f"[{DAG_ID}] batch inserted={inserted}")
 
-    while t < to_dt and windows_done < windows_budget:
-        w_from = t
-        w_to = min(t + step, to_dt)
-
-        row = hook.get_first(_sql_insert_window(_ms(w_from), _ms(w_to)))
-        inserted_rows = int(row[0]) if row and row[0] is not None else 0
-
-        inserted_total += inserted_rows
-        windows_done += 1
-        print(
-            f"[{DAG_ID}] window [{w_from.isoformat()}..{w_to.isoformat()}) inserted={inserted_rows}")
-
-        t = w_to
-
-    remaining = to_dt - t
-    print(
-        f"[{DAG_ID}] DONE mode={CFG.mode} windows_done={windows_done} inserted_total={inserted_total} "
-        f"stopped_at={t.isoformat()} remaining={remaining}"
-    )
+    print(f"[{DAG_ID}] DONE inserted_total={inserted_total}")
 
 
 default_args: dict[str, Any] = {
