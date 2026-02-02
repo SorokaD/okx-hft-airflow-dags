@@ -47,6 +47,10 @@ class EtlConfig:
     # ingestion window
     overlap_minutes: int = 2
 
+    # batch by time to avoid huge single query
+    chunk_hours: int = 2
+    max_chunks_per_run: int | None = None
+
     # statement timeout (ms)
     statement_timeout_ms: int = 30 * 60 * 1000
 
@@ -178,10 +182,25 @@ def run_sync() -> None:
         from_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
     print(f"[{DAG_ID}] db={dbname} window=[{from_dt}..{to_dt}) top_n={CFG.top_n}")
-    sql = _sql_upsert_levels_window(from_dt, to_dt)
-    row = hook.get_first(sql)
-    upserted = int(row[0]) if row and row[0] is not None else 0
-    print(f"[{DAG_ID}] DONE upserted_total={upserted}")
+
+    chunk = timedelta(hours=CFG.chunk_hours)
+    t = from_dt
+    chunks_done = 0
+    upserted_total = 0
+
+    while t < to_dt and (CFG.max_chunks_per_run is None or chunks_done < CFG.max_chunks_per_run):
+        w_from = t
+        w_to = min(t + chunk, to_dt)
+        sql = _sql_upsert_levels_window(w_from, w_to)
+        cursor.execute(sql)
+        row = cursor.fetchone()
+        upserted = int(row[0]) if row and row[0] is not None else 0
+        upserted_total += upserted
+        chunks_done += 1
+        print(f"[{DAG_ID}] chunk [{w_from.isoformat()}..{w_to.isoformat()}) upserted={upserted}")
+        t = w_to
+
+    print(f"[{DAG_ID}] DONE chunks_done={chunks_done} upserted_total={upserted_total}")
 
 
 # ============================================================
