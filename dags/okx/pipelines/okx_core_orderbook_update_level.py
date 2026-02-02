@@ -178,8 +178,11 @@ def run_sync() -> None:
         return
 
     if from_dt is None:
-        # при первом запуске берем все до to_dt
-        from_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        # если dst пустой — стартуем от последней записи в src (минус overlap)
+        if src_max is None:
+            print(f"[{DAG_ID}] SKIP: src empty (no data to build levels)")
+            return
+        from_dt = src_max - timedelta(minutes=CFG.overlap_minutes)
 
     print(f"[{DAG_ID}] db={dbname} window=[{from_dt}..{to_dt}) top_n={CFG.top_n}")
 
