@@ -33,6 +33,25 @@ CHILD_DAGS_IN_ORDER = [
 
 # Ожидание через ExternalTaskSensor надёжнее, чем wait_for_completion=True в триггере
 # (известный баг: TriggerDagRunOperator иногда не видит success дочернего DAG).
+#
+# Важно: триггер передаёт conf={"logical_date": "{{ data_interval_end }}"}, и дочерний
+# run создаётся с execution_date = data_interval_end. Сенсор по умолчанию ищет задачу
+# с execution_date текущего run (00:10:00) — даты не совпадают, сенсор "залипает".
+# execution_date_fn возвращает data_interval_end, чтобы искать тот же run, что создал триггер.
+
+
+def _external_execution_date_fn(execution_date, context=None, **kwargs):
+    """Возвращаем data_interval_end — с ним создаётся дочерний run (conf logical_date)."""
+    ctx = context if isinstance(context, dict) else kwargs
+    end = ctx.get("data_interval_end") if isinstance(ctx, dict) else None
+    if end is not None:
+        return end
+    # Fallback: schedule "10 0 * * *" => data_interval_end = следующий день 00:00 UTC
+    if execution_date.tzinfo is None:
+        execution_date = execution_date.replace(tzinfo=timezone.utc)
+    day_start = execution_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start + timedelta(days=1)
+
 
 default_args = {
     "owner": "okx-data",
@@ -68,6 +87,7 @@ with DAG(
             failed_states=["failed"],
             poke_interval=60,
             mode="poke",
+            execution_date_fn=_external_execution_date_fn,
         )
         trigger >> wait
         if prev is not None:
