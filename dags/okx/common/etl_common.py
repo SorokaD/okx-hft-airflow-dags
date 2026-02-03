@@ -57,6 +57,11 @@ def get_logical_run_date() -> datetime:
         dt = parse_run_date(conf.get("data_interval_end"))
         if dt is not None:
             return dt
+        # conf передан, но даты не распарсились — не молча грузить по now(utc)
+        raise ValueError(
+            "get_logical_run_date: conf передан, но logical_date и data_interval_end "
+            "не удалось распарсить. Проверьте, что мастер передаёт ISO-строки в conf."
+        )
 
     logical_date = ctx.get("logical_date")
     if isinstance(logical_date, datetime):
