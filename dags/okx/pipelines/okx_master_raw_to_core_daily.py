@@ -27,16 +27,20 @@ CHILD_DAGS_IN_ORDER = [
 ]
 
 
+# Максимум ожидания дочернего DAG (не висеть бесконечно при «залипании»)
+TRIGGER_TASK_TIMEOUT_SEC = 6 * 60 * 60
+
 default_args = {
     "owner": "okx-data",
     "retries": 0,
     "retry_delay": timedelta(minutes=5),
+    "execution_timeout": timedelta(seconds=TRIGGER_TASK_TIMEOUT_SEC),
 }
 
 
 with DAG(
     dag_id=MASTER_DAG_ID,
-    description="OKX master DAG: sequential t-1 raw->core and dependent core->core loads",
+    description="OKX master: t-1 raw->core and core->core loads (sequential)",
     default_args=default_args,
     start_date=datetime(2026, 2, 1, tzinfo=timezone.utc),
     schedule=SCHEDULE,
