@@ -41,12 +41,9 @@ CHILD_DAGS_IN_ORDER = [
 
 
 def _external_execution_date_fn(execution_date, context=None, **kwargs):
-    """Возвращаем data_interval_end — с ним создаётся дочерний run (conf logical_date)."""
-    ctx = context if isinstance(context, dict) else kwargs
-    end = ctx.get("data_interval_end") if isinstance(ctx, dict) else None
-    if end is not None:
-        return end
-    # Fallback: schedule "10 0 * * *" => data_interval_end = следующий день 00:00 UTC
+    """Execution date дочернего run = следующий день 00:00 UTC (как data_interval_end при 10 0 * * *)."""
+    # Контекст может отдавать data_interval_end с 00:10 вместо 00:00 — триггер создаёт run с 00:00.
+    # Единообразно возвращаем полночь следующего дня.
     if execution_date.tzinfo is None:
         execution_date = execution_date.replace(tzinfo=timezone.utc)
     day_start = execution_date.replace(hour=0, minute=0, second=0, microsecond=0)
