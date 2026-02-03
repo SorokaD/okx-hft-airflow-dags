@@ -35,15 +35,27 @@ def parse_run_date(value: object) -> datetime | None:
 
 
 def get_logical_run_date() -> datetime:
+    """
+    Дата run'а для t-1: при запуске через мастер — из dag_run.conf
+    (logical_date или data_interval_end); при ручном — из context.
+    Окно загрузки: ts_ingest < day_start_utc(run_dt) = полночь data_interval_end.
+    """
     try:
         ctx = get_current_context()
     except Exception:
+        logger.warning("get_logical_run_date: no context, using now(utc)")
         return datetime.now(timezone.utc)
 
     dr = ctx.get("dag_run")
-    if dr and dr.conf:
-        dt = parse_run_date(dr.conf.get("logical_date"))
-        if dt:
+    if dr and isinstance(getattr(dr, "conf", None), dict):
+        conf = dr.conf
+        # Сначала logical_date (мастер передаёт data_interval_end как logical_date)
+        dt = parse_run_date(conf.get("logical_date"))
+        if dt is not None:
+            return dt
+        # Запасной вариант: data_interval_end из conf (тот же контракт)
+        dt = parse_run_date(conf.get("data_interval_end"))
+        if dt is not None:
             return dt
 
     logical_date = ctx.get("logical_date")
@@ -54,6 +66,9 @@ def get_logical_run_date() -> datetime:
     if isinstance(data_interval_end, datetime):
         return data_interval_end.astimezone(timezone.utc)
 
+    logger.warning(
+        "get_logical_run_date: no conf and no context date, using now(utc)"
+    )
     return datetime.now(timezone.utc)
 
 
@@ -80,7 +95,8 @@ def db_sanity_checks(cursor, expected_db: str) -> None:
     dbname = row[0] if row else None
     if expected_db and dbname != expected_db:
         raise RuntimeError(
-            f"Connected to unexpected database: {dbname} (expected {expected_db})"
+            f"Connected to unexpected database: {dbname} "
+            f"(expected {expected_db})"
         )
 
 
@@ -134,4 +150,4 @@ def log_diagnostics(cursor, tables: Iterable[str]) -> None:
 
 def batch_iter(values: list[str], batch_size: int) -> Iterable[list[str]]:
     for i in range(0, len(values), batch_size):
-        yield values[i : i + batch_size]
+        yield values[i:i + batch_size]

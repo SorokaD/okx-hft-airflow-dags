@@ -24,9 +24,11 @@ CHILD_DAGS_IN_ORDER = [
     "okx_core_tick_to_core_funding_rate_event",
 ]
 
-# Без wait_for_completion и без сенсоров: мастер только запускает дочерние DAG по очереди
-# и сразу идёт дальше. Дочерние отрабатывают сами (по одному или параллельно — как решит executor).
-# Так мастер не зависает; порядок запуска сохраняется (ticker → trades → ...).
+# t-1 контракт: мастер запускается в 00:10 UTC (cron "10 0 * * *").
+# data_interval мастера: [2026-02-02 00:00, 2026-02-03 00:00) → data_interval_end = 2026-02-03 00:00.
+# В conf передаём data_interval_start и data_interval_end (ISO-строки), чтобы дочерние DAG
+# считали окно так же: to_dt = data_interval_end (полночь следующего дня), грузим ts_ingest < to_dt.
+# Без wait_for_completion и сенсоров: мастер только запускает дочерние по очереди.
 
 default_args = {
     "owner": "okx-data",
@@ -48,7 +50,13 @@ with DAG(
         trigger = TriggerDagRunOperator(
             task_id=f"run_{child_dag_id}",
             trigger_dag_id=child_dag_id,
-            conf={"logical_date": "{{ data_interval_end }}"},
+            # Единый контракт t-1: передаём data_interval мастера в conf (ISO-строки).
+            # Дочерние читают logical_date или data_interval_end из conf через get_logical_run_date().
+            conf={
+                "logical_date": "{{ data_interval_end.isoformat() }}",
+                "data_interval_start": "{{ data_interval_start.isoformat() }}",
+                "data_interval_end": "{{ data_interval_end.isoformat() }}",
+            },
             wait_for_completion=False,
             reset_dag_run=True,
         )
