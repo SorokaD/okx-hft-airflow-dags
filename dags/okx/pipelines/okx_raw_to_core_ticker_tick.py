@@ -47,6 +47,7 @@ class EtlConfig:
     overlap_minutes: int = 2
 
     # batching by instrument
+    batch_by_instid: bool = False
     batch_size: int = 20
     max_instruments_per_run: int | None = None
 
@@ -158,6 +159,14 @@ def run_sync() -> None:
     raw_max_ms = _get_raw_max_ts_ingest_ms(cursor)
     if raw_max_ms is None or (from_dt is not None and raw_max_ms < ms(from_dt)):
         print(f"[{DAG_ID}] SKIP: raw empty or older than window raw_max_ms={raw_max_ms}")
+        return
+
+    if not CFG.batch_by_instid:
+        sql, params = _sql_insert_bulk(where_sql, None)
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        inserted_total = int(row[0]) if row and row[0] is not None else 0
+        print(f"[{DAG_ID}] inserted_total={inserted_total}")
         return
 
     instids = _get_distinct_instids(cursor, where_sql, "b")
