@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime, timedelta, timezone
+from typing import Any, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -10,8 +10,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from okx.common.etl_common import (
     db_sanity_checks,
-    day_start_utc,
-    get_logical_run_date,
     log_diagnostics,
 )
 
@@ -34,6 +32,9 @@ class EtlConfig:
     chunk_hours: int = 2
     statement_timeout_ms: int = 30 * 60 * 1000
 
+    # чтобы не считать «самый конец», пока источники ещё догружаются
+    safety_lag_seconds: int = 5
+
     execution_timeout_sec: int = 2 * 60 * 60
     retries: int = 1
     retry_delay_sec: int = 120
@@ -48,8 +49,30 @@ def _get_dst_watermark_dt(cursor) -> datetime | None:
     return row[0] if row and row[0] is not None else None
 
 
+def _get_src_bounds(cursor) -> Tuple[datetime | None, datetime | None]:
+    """
+    Возвращает:
+      src_min_dt = max(min_trades, min_book)
+      src_max_dt = min(max_trades, max_book)
+    Идея: trades и book должны существовать для одного окна.
+    """
+    cursor.execute(
+        f"SELECT min(ts_event), max(ts_event) FROM {CFG.src_trades_fq};")
+    tr_min, tr_max = cursor.fetchone()
+
+    cursor.execute(
+        f"SELECT min(ts_event), max(ts_event) FROM {CFG.src_book_fq};")
+    bk_min, bk_max = cursor.fetchone()
+
+    if tr_min is None or tr_max is None or bk_min is None or bk_max is None:
+        return None, None
+
+    src_min_dt = max(tr_min, bk_min)
+    src_max_dt = min(tr_max, bk_max)
+    return src_min_dt, src_max_dt
+
+
 def _sql_upsert_feat_window(from_dt: datetime, to_dt: datetime) -> str:
-    # bucket 10ms в UTC: floor(epoch*100)/100 сек
     return f"""
     WITH params AS (
       SELECT
@@ -86,10 +109,8 @@ def _sql_upsert_feat_window(from_dt: datetime, to_dt: datetime) -> str:
         b.mid_px,
         b.spread_px,
 
-        -- microprice = (ask*bid_sz + bid*ask_sz) / (bid_sz+ask_sz)
         ((b.ask_px_01 * b.bid_sz_01 + b.bid_px_01 * b.ask_sz_01) / NULLIF((b.bid_sz_01 + b.ask_sz_01), 0.0))::float8 AS microprice,
 
-        -- imbalance на 1/5/10 уровнях
         ((b.bid_sz_01 - b.ask_sz_01) / NULLIF((b.bid_sz_01 + b.ask_sz_01), 0.0))::float8 AS imb_01,
 
         ((
@@ -172,21 +193,36 @@ def run_sync() -> None:
     log_diagnostics(cursor, [CFG.src_trades_fq,
                     CFG.src_book_fq, CFG.dst_feat_fq])
 
-    run_dt = get_logical_run_date()
-    to_dt = day_start_utc(run_dt)
+    src_min_dt, src_max_dt = _get_src_bounds(cursor)
+    if src_min_dt is None or src_max_dt is None:
+        print(f"[{DAG_ID}] sources are empty -> nothing to do")
+        return
+
+    # безопасный горизонт конца (не лезем в самый край источника)
+    safety_lag = timedelta(seconds=CFG.safety_lag_seconds)
+    to_dt = src_max_dt - safety_lag
 
     wm = _get_dst_watermark_dt(cursor)
-    from_dt = wm - timedelta(minutes=CFG.overlap_minutes) if wm else None
 
-    if from_dt is None:
-        # если feat пустой — строим t-1
-        from_dt = to_dt - timedelta(days=1)
+    if wm is None:
+        # feat пустой -> стартуем от реального начала источников
+        from_dt = src_min_dt
+    else:
+        # продолжаем с водяного знака (с overlap)
+        from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
+        if from_dt < src_min_dt:
+            from_dt = src_min_dt
 
-    print(f"[{DAG_ID}] window=[{from_dt}..{to_dt})")
+    if from_dt >= to_dt:
+        print(f"[{DAG_ID}] up-to-date: window=[{from_dt}..{to_dt}) -> nothing to do")
+        return
+
+    print(f"[{DAG_ID}] window=[{from_dt}..{to_dt}) src_min={src_min_dt} src_max={src_max_dt} wm={wm}")
 
     chunk = timedelta(hours=CFG.chunk_hours)
     t = from_dt
     total = 0
+
     while t < to_dt:
         w_from = t
         w_to = min(t + chunk, to_dt)
