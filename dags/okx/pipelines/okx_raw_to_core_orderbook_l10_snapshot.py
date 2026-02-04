@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Sequence, Tuple
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -11,8 +11,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 from okx.common.etl_common import (
     batch_iter,
     db_sanity_checks,
-    day_start_utc,
-    get_logical_run_date,
     log_diagnostics,
     ms,
 )
@@ -25,7 +23,7 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_raw_to_core_orderbook_l10_snapshot"
-SCHEDULE = None  # запускается master DAG (t-1)
+SCHEDULE = None  # запускается вручную или master DAG
 
 TAGS = ["okx", "etl", "raw-to-core", "timescaledb", "orderbook", "l10"]
 
@@ -55,6 +53,9 @@ class EtlConfig:
     # statement timeout (ms)
     statement_timeout_ms: int = 30 * 60 * 1000
 
+    # safety: не лезем в самый хвост источника
+    safety_lag_seconds: int = 5
+
     # safety/ops
     execution_timeout_sec: int = 2 * 60 * 60  # 2 часа
     retries: int = 1
@@ -69,19 +70,36 @@ CFG = EtlConfig()
 # ============================================================
 
 def _get_core_watermark_dt(cursor) -> datetime | None:
+    """
+    Водяной знак по core: max(ts_ingest)
+    (мы грузим по окну ingest, поэтому watermark тоже по ingest)
+    """
     cursor.execute(f"SELECT max(ts_ingest) FROM {CFG.core_table_fq};")
     row = cursor.fetchone()
     return row[0] if row and row[0] is not None else None
 
 
-def _get_raw_max_ts_ingest_ms(cursor) -> int | None:
-    cursor.execute(f"SELECT max(ts_ingest_ms) FROM {CFG.raw_table_fq};")
+def _get_raw_bounds_by_ingest(cursor) -> Tuple[datetime | None, datetime | None]:
+    """
+    Границы по raw ingest:
+      min_ingest_dt, max_ingest_dt
+    Берём из ts_ingest_ms, чтобы не зависеть от timezone и форматов.
+    """
+    cursor.execute(
+        f"SELECT min(ts_ingest_ms), max(ts_ingest_ms) FROM {CFG.raw_table_fq};")
     row = cursor.fetchone()
-    return int(row[0]) if row and row[0] is not None else None
+    if not row or row[0] is None or row[1] is None:
+        return None, None
+    min_ms = int(row[0])
+    max_ms = int(row[1])
+    min_dt = datetime.fromtimestamp(min_ms / 1000.0, tz=timezone.utc)
+    max_dt = datetime.fromtimestamp(max_ms / 1000.0, tz=timezone.utc)
+    return min_dt, max_dt
 
 
 def _get_distinct_instids(cursor, where_sql: str) -> list[str]:
-    cursor.execute(f"SELECT DISTINCT r.instid FROM {CFG.raw_table_fq} r WHERE {where_sql};")
+    cursor.execute(
+        f"SELECT DISTINCT r.instid FROM {CFG.raw_table_fq} r WHERE {where_sql};")
     return [r[0] for r in cursor.fetchall() if r and r[0] is not None]
 
 
@@ -90,6 +108,9 @@ def _sql_upsert_bulk(where_sql: str, instids: Sequence[str] | None) -> tuple[str
     bid = int(CFG.bid_side_value)
     ask = int(CFG.ask_side_value)
 
+    # ВАЖНО: ON CONFLICT должен соответствовать реальному PK:
+    # PRIMARY KEY (inst_id, ts_event, snapshot_id)
+    # Иначе будет ошибка "no unique constraint matching ON CONFLICT"
     return f"""
     WITH base AS (
       SELECT
@@ -99,7 +120,6 @@ def _sql_upsert_bulk(where_sql: str, instids: Sequence[str] | None) -> tuple[str
         r.ts_event_ms::bigint AS ts_event_ms,
         r.ts_ingest_ms::bigint AS ts_ingest_ms,
 
-        -- Важно: to_timestamp() уже timestamptz (UTC), AT TIME ZONE тут не нужен.
         to_timestamp(r.ts_event_ms / 1000.0)::timestamptz AS ts_event,
         to_timestamp(r.ts_ingest_ms / 1000.0)::timestamptz AS ts_ingest,
 
@@ -195,7 +215,7 @@ def _sql_upsert_bulk(where_sql: str, instids: Sequence[str] | None) -> tuple[str
         ask_px_06,ask_sz_06,ask_px_07,ask_sz_07,ask_px_08,ask_sz_08,ask_px_09,ask_sz_09,ask_px_10,ask_sz_10,
         mid_px, spread_px
       FROM enrich
-      ON CONFLICT (inst_id, snapshot_id)
+      ON CONFLICT (inst_id, ts_event, snapshot_id)
       DO NOTHING
       RETURNING 1
     )
@@ -217,21 +237,32 @@ def run_sync() -> None:
     cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
     log_diagnostics(cursor, [CFG.raw_table_fq, CFG.core_table_fq])
 
-    run_dt = get_logical_run_date()
-    to_dt = day_start_utc(run_dt)
-
-    wm = _get_core_watermark_dt(cursor)
-    from_dt = wm - timedelta(minutes=CFG.overlap_minutes) if wm else None
-
-    to_ms = ms(to_dt)
-    where_sql = f"r.ts_ingest_ms < {to_ms}"
-    if from_dt is not None:
-        where_sql = f"r.ts_ingest_ms >= {ms(from_dt)} AND " + where_sql
-
-    raw_max_ms = _get_raw_max_ts_ingest_ms(cursor)
-    if raw_max_ms is None or (from_dt is not None and raw_max_ms < ms(from_dt)):
-        print(f"[{DAG_ID}] SKIP: raw empty or older than window raw_max_ms={raw_max_ms}")
+    # 1) Границы источника
+    src_min_dt, src_max_dt = _get_raw_bounds_by_ingest(cursor)
+    if src_min_dt is None or src_max_dt is None:
+        print(f"[{DAG_ID}] SKIP: raw is empty")
         return
+
+    # 2) to_dt = конец источника минус safety lag
+    safety_lag = timedelta(seconds=CFG.safety_lag_seconds)
+    to_dt = src_max_dt - safety_lag
+
+    # 3) from_dt = watermark core (по ts_ingest) либо начало источника
+    wm = _get_core_watermark_dt(cursor)
+    if wm is None:
+        from_dt = src_min_dt
+    else:
+        from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
+        if from_dt < src_min_dt:
+            from_dt = src_min_dt
+
+    if from_dt >= to_dt:
+        print(f"[{DAG_ID}] up-to-date: window=[{from_dt}..{to_dt}) -> nothing to do")
+        return
+
+    # 4) фильтр по ingest_ms (как и раньше), но окно теперь честное от источника/водяного знака
+    where_sql = f"r.ts_ingest_ms >= {ms(from_dt)} AND r.ts_ingest_ms < {ms(to_dt)}"
+    print(f"[{DAG_ID}] window=[{from_dt}..{to_dt}) where=[{where_sql}] wm={wm} src=[{src_min_dt}..{src_max_dt})")
 
     instids = _get_distinct_instids(cursor, where_sql)
     if CFG.max_instruments_per_run is not None:
@@ -243,10 +274,11 @@ def run_sync() -> None:
         cursor.execute(sql, params)
         row = cursor.fetchone()
         inserted_total = int(row[0]) if row and row[0] is not None else 0
-        print(f"[{DAG_ID}] inserted_total={inserted_total}")
+        print(f"[{DAG_ID}] DONE inserted_total={inserted_total}")
         return
 
-    print(f"[{DAG_ID}] batching instid count={len(instids)} batch_size={CFG.batch_size}")
+    print(
+        f"[{DAG_ID}] batching instid count={len(instids)} batch_size={CFG.batch_size}")
     for batch in batch_iter(instids, CFG.batch_size):
         sql, params = _sql_upsert_bulk(where_sql, batch)
         cursor.execute(sql, params)
