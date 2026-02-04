@@ -38,20 +38,6 @@ default_args = {
 }
 
 
-@provide_session
-def _check_children_not_paused(session=None) -> None:
-    """Падаем, если хотя бы один дочерний DAG на паузе — иначе зелёный мастер без данных."""
-    for dag_id in CHILD_DAGS_IN_ORDER:
-        row = session.query(DagModel).filter(DagModel.dag_id == dag_id).first()
-        if row is None:
-            raise RuntimeError(f"[{MASTER_DAG_ID}] Дочерний DAG не найден: {dag_id}")
-        if row.is_paused:
-            raise RuntimeError(
-                f"[{MASTER_DAG_ID}] Дочерний DAG на паузе: {dag_id}. "
-                "Снимите с паузы перед запуском мастера."
-            )
-
-
 with DAG(
     dag_id=MASTER_DAG_ID,
     description="OKX master: t-1 raw->core and core->feat/core->core (trigger only, no wait)",
