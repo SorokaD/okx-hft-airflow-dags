@@ -6,7 +6,7 @@ from airflow import DAG
 from airflow.models.dag import DagModel
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.utils.session import provide_session
+from airflow.utils.session import create_session
 
 
 MASTER_DAG_ID = "okx_master_raw_to_core_daily"
@@ -52,7 +52,7 @@ with DAG(
 
     def _check_children_not_paused() -> None:
         """Падаем, если хотя бы один дочерний DAG на паузе — иначе зелёный мастер без данных."""
-        with provide_session() as session:
+        with create_session() as session:
             for dag_id in CHILD_DAGS_IN_ORDER:
                 row = session.query(DagModel).filter(DagModel.dag_id == dag_id).first()
                 if row is None:
