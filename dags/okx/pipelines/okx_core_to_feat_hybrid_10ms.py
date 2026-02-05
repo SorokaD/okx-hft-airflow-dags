@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Tuple
 
 from airflow import DAG
@@ -32,8 +32,12 @@ class EtlConfig:
     chunk_hours: int = 2
     statement_timeout_ms: int = 30 * 60 * 1000
 
-    # чтобы не считать «самый конец», пока источники ещё догружаются
+    # не считаем самый хвост, пока core ещё может догружаться
     safety_lag_seconds: int = 5
+
+    # (опционально) чтобы за 1 запуск не пытался прожевать бесконечный backlog
+    # поставь None, если хочешь "всё сразу"
+    max_catchup_hours_per_run: int | None = 24
 
     execution_timeout_sec: int = 2 * 60 * 60
     retries: int = 1
@@ -51,10 +55,9 @@ def _get_dst_watermark_dt(cursor) -> datetime | None:
 
 def _get_src_bounds(cursor) -> Tuple[datetime | None, datetime | None]:
     """
-    Возвращает:
+    Границы источников в core:
       src_min_dt = max(min_trades, min_book)
       src_max_dt = min(max_trades, max_book)
-    Идея: trades и book должны существовать для одного окна.
     """
     cursor.execute(
         f"SELECT min(ts_event), max(ts_event) FROM {CFG.src_trades_fq};")
@@ -67,9 +70,7 @@ def _get_src_bounds(cursor) -> Tuple[datetime | None, datetime | None]:
     if tr_min is None or tr_max is None or bk_min is None or bk_max is None:
         return None, None
 
-    src_min_dt = max(tr_min, bk_min)
-    src_max_dt = min(tr_max, bk_max)
-    return src_min_dt, src_max_dt
+    return max(tr_min, bk_min), min(tr_max, bk_max)
 
 
 def _sql_upsert_feat_window(from_dt: datetime, to_dt: datetime) -> str:
@@ -198,17 +199,15 @@ def run_sync() -> None:
         print(f"[{DAG_ID}] sources are empty -> nothing to do")
         return
 
-    # безопасный горизонт конца (не лезем в самый край источника)
-    safety_lag = timedelta(seconds=CFG.safety_lag_seconds)
-    to_dt = src_max_dt - safety_lag
+    # to_dt = актуальный max по источникам (trades+book) минус safety lag
+    to_dt = src_max_dt - timedelta(seconds=CFG.safety_lag_seconds)
 
     wm = _get_dst_watermark_dt(cursor)
 
+    # from_dt = watermark в feat (или начало источников, если feat пустой)
     if wm is None:
-        # feat пустой -> стартуем от реального начала источников
         from_dt = src_min_dt
     else:
-        # продолжаем с водяного знака (с overlap)
         from_dt = wm - timedelta(minutes=CFG.overlap_minutes)
         if from_dt < src_min_dt:
             from_dt = src_min_dt
@@ -217,7 +216,15 @@ def run_sync() -> None:
         print(f"[{DAG_ID}] up-to-date: window=[{from_dt}..{to_dt}) -> nothing to do")
         return
 
-    print(f"[{DAG_ID}] window=[{from_dt}..{to_dt}) src_min={src_min_dt} src_max={src_max_dt} wm={wm}")
+    # (опционально) ограничим объём догонки за 1 запуск, чтобы не убить базу
+    if CFG.max_catchup_hours_per_run is not None:
+        limit_to = from_dt + \
+            timedelta(hours=int(CFG.max_catchup_hours_per_run))
+        if limit_to < to_dt:
+            print(f"[{DAG_ID}] catchup cap: limiting to_dt {to_dt} -> {limit_to}")
+            to_dt = limit_to
+
+    print(f"[{DAG_ID}] window=[{from_dt}..{to_dt}) src=[{src_min_dt}..{src_max_dt}) wm={wm}")
 
     chunk = timedelta(hours=CFG.chunk_hours)
     t = from_dt
