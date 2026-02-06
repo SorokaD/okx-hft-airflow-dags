@@ -10,7 +10,8 @@ from airflow.utils.session import create_session
 
 
 MASTER_DAG_ID = "okx_master_raw_to_core_daily"
-SCHEDULE = "10 0 * * *"  # t-1: 00:10 UTC, data_interval = [вчера 00:00, сегодня 00:00)
+# t-1: 00:10 UTC, data_interval = [вчера 00:00, сегодня 00:00)
+SCHEDULE = "10 0 * * *"
 
 TAGS = ["okx", "etl", "master", "raw-to-core", "t-1"]
 
@@ -20,7 +21,7 @@ CHILD_DAGS_IN_ORDER = [
     "okx_raw_to_core_trades_tick",
     # Orderbook snapshots:
     # (оставляем, если этот DAG уже существует и делает raw->core по snapshot-таблице)
-    #"okx_raw_to_core_orderbook_snapshot",
+    # "okx_raw_to_core_orderbook_snapshot",
     # Новый компактный слой L10 из raw snapshots:
     "okx_raw_to_core_orderbook_l10_snapshot",
     "okx_raw_to_core_funding_rate_tick",
@@ -53,9 +54,11 @@ with DAG(
         """Падаем, если хотя бы один дочерний DAG на паузе — иначе зелёный мастер без данных."""
         with create_session() as session:
             for dag_id in CHILD_DAGS_IN_ORDER:
-                row = session.query(DagModel).filter(DagModel.dag_id == dag_id).first()
+                row = session.query(DagModel).filter(
+                    DagModel.dag_id == dag_id).first()
                 if row is None:
-                    raise RuntimeError(f"[{MASTER_DAG_ID}] Дочерний DAG не найден: {dag_id}")
+                    raise RuntimeError(
+                        f"[{MASTER_DAG_ID}] Дочерний DAG не найден: {dag_id}")
                 if row.is_paused:
                     raise RuntimeError(
                         f"[{MASTER_DAG_ID}] Дочерний DAG на паузе: {dag_id}. "
@@ -78,8 +81,10 @@ with DAG(
                 "data_interval_start": "{{ data_interval_start.isoformat() }}",
                 "data_interval_end": "{{ data_interval_end.isoformat() }}",
             },
-            wait_for_completion=False,
+            wait_for_completion=True,
             reset_dag_run=True,
+            allowed_states=["success"],
+            failed_states=["failed", "upstream_failed"],
         )
         if prev is None:
             check >> trigger
