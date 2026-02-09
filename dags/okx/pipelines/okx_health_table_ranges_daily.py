@@ -13,7 +13,6 @@ TAGS = ["okx", "health", "timescaledb", "sanity"]
 
 
 SQL_DDL = """
-CREATE SCHEMA IF NOT EXISTS okx_health;
 
 CREATE TABLE IF NOT EXISTS okx_health.table_ranges_daily (
   run_ts_utc       timestamptz NOT NULL DEFAULT now(),
