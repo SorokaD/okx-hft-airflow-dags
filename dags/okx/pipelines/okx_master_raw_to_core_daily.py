@@ -31,6 +31,8 @@ CHILD_DAGS_IN_ORDER = [
     "okx_core_tick_to_core_funding_rate_event",
     # Новый feature слой:
     "okx_core_to_feat_hybrid_10ms",
+    # Health tables:
+    "okx_health_table_ranges_daily",
 ]
 
 default_args = {
@@ -91,3 +93,4 @@ with DAG(
         else:
             prev >> trigger
         prev = trigger
+ 
