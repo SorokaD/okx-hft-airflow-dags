@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from airflow import DAG
@@ -8,142 +7,127 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 CONN_ID = "timescaledb"
-DAG_ID = "okx_health_table_inventory_daily"
+DAG_ID = "okx_health_table_ranges_daily"
 SCHEDULE = None  # запускается master DAG (t-1)
-TAGS = ["okx", "health", "timescaledb", "inventory", "sanity"]
+TAGS = ["okx", "health", "timescaledb", "sanity"]
 
-
-@dataclass(frozen=True)
-class Config:
-    retention_days: int = 30  # история для Superset (графики роста)
-
-
-CFG = Config()
-
-# ВАЖНО:
-# Таблицу/индексы создай один раз админом (DDL я ниже повторю).
-# В DAG DDL НЕ выполняем, чтобы не упираться в owner/privileges.
-
-SQL_UPSERT = """
-WITH
-plain_tables AS (
-  SELECT
-    n.nspname AS table_schema,
-    c.relname AS table_name,
-
-    pg_total_relation_size(c.oid) AS total_bytes,
-    pg_relation_size(c.oid)       AS heap_bytes,
-    (pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes_toast_bytes,
-
-    NULLIF(st.n_live_tup, -1)::bigint AS approx_row_count,
-
-    NULL::timestamptz AS min_ts,
-    NULL::timestamptz AS max_ts,
-
-    false AS is_hypertable
-  FROM pg_class c
-  JOIN pg_namespace n ON n.oid = c.relnamespace
-  LEFT JOIN pg_stat_all_tables st ON st.relid = c.oid
-  WHERE c.relkind = 'r'
-    AND n.nspname NOT IN ('pg_catalog','information_schema')
-    AND n.nspname NOT LIKE 'pg_toast%'
-    AND n.nspname NOT LIKE '_timescaledb_%'
-),
-
-hypertables AS (
-  SELECT
-    ht.hypertable_schema AS table_schema,
-    ht.hypertable_name   AS table_name,
-
-    SUM(pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)) AS total_bytes,
-    SUM(pg_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass))       AS heap_bytes,
-    SUM(
-      pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
-      - pg_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
-    ) AS indexes_toast_bytes,
-
-    NULLIF(SUM(pc.reltuples), -1)::bigint AS approx_row_count,
-
-    MIN(c.range_start) AS min_ts,
-    MAX(c.range_end)   AS max_ts,
-
-    true AS is_hypertable
-  FROM timescaledb_information.hypertables ht
-  JOIN timescaledb_information.chunks c
-    ON c.hypertable_schema = ht.hypertable_schema
-   AND c.hypertable_name   = ht.hypertable_name
-  JOIN pg_class pc
-    ON pc.oid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
-  GROUP BY 1,2
-),
-
-all_tables AS (
-  SELECT * FROM plain_tables
-  UNION ALL
-  SELECT * FROM hypertables
-),
-
-dedup AS (
-  SELECT *
-  FROM (
-    SELECT
-      *,
-      ROW_NUMBER() OVER (
-        PARTITION BY table_schema, table_name
-        ORDER BY is_hypertable DESC
-      ) AS rn
-    FROM all_tables
-  ) x
-  WHERE rn = 1
-)
-
-INSERT INTO okx_health.table_inventory_daily (
-  run_ts_utc,
-  logical_date_utc,
-  table_schema,
-  table_name,
-  is_hypertable,
-  total_bytes,
-  heap_bytes,
-  indexes_toast_bytes,
-  approx_row_count,
-  min_ts,
-  max_ts,
-  coverage_days
-)
-SELECT
-  now() AT TIME ZONE 'utc' AS run_ts_utc,
-  %(logical_date_utc)s::timestamptz AS logical_date_utc,
-  table_schema,
-  table_name,
-  is_hypertable,
-  total_bytes,
-  heap_bytes,
-  indexes_toast_bytes,
-  approx_row_count,
-  min_ts,
-  max_ts,
-  CASE
-    WHEN min_ts IS NULL OR max_ts IS NULL THEN NULL
-    ELSE ROUND(EXTRACT(EPOCH FROM (max_ts - min_ts)) / 86400.0, 2)
-  END AS coverage_days
-FROM dedup
-ON CONFLICT (logical_date_utc, table_schema, table_name)
-DO UPDATE SET
-  run_ts_utc          = now(),
-  is_hypertable       = EXCLUDED.is_hypertable,
-  total_bytes         = EXCLUDED.total_bytes,
-  heap_bytes          = EXCLUDED.heap_bytes,
-  indexes_toast_bytes = EXCLUDED.indexes_toast_bytes,
-  approx_row_count    = EXCLUDED.approx_row_count,
-  min_ts              = EXCLUDED.min_ts,
-  max_ts              = EXCLUDED.max_ts,
-  coverage_days       = EXCLUDED.coverage_days;
+SQL_DDL = """
+CREATE TABLE IF NOT EXISTS okx_health.table_ranges_daily (
+  run_ts_utc       timestamptz NOT NULL DEFAULT now(),
+  logical_date_utc timestamptz NOT NULL,
+  table_name       text        NOT NULL,
+  min_ts           timestamptz NULL,
+  max_ts           timestamptz NULL,
+  history_days     numeric(18,2) NULL,
+  rows_cnt         bigint      NOT NULL,
+  PRIMARY KEY (logical_date_utc, table_name)
+);
 """
 
+SQL_UPSERT = """
+INSERT INTO okx_health.table_ranges_daily
+  (logical_date_utc, table_name, min_ts, max_ts, history_days, rows_cnt)
+SELECT
+  %(logical_date_utc)s::timestamptz AS logical_date_utc,
+  q.table_name,
+  q.min_ts,
+  q.max_ts,
+  q.history_days,
+  q.rows_cnt
+FROM (
+  SELECT
+    'fact_funding_rate_event' AS table_name,
+    min(ts_event) AS min_ts,
+    max(ts_event) AS max_ts,
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2) AS history_days,
+    COUNT(*) AS rows_cnt
+  FROM okx_core.fact_funding_rate_event
+
+  UNION ALL
+  SELECT
+    'fact_funding_rate_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_funding_rate_tick
+
+  UNION ALL
+  SELECT
+    'fact_index_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_index_tick
+
+  UNION ALL
+  SELECT
+    'fact_mark_price_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_mark_price_tick
+
+  UNION ALL
+  SELECT
+    'fact_open_interest_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_open_interest_tick
+
+  UNION ALL
+  SELECT
+    'fact_orderbook_l10_snapshot',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_orderbook_l10_snapshot
+
+  UNION ALL
+  SELECT
+    'fact_ticker_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_ticker_tick
+
+  UNION ALL
+  SELECT
+    'fact_trades_tick',
+    min(ts_event),
+    max(ts_event),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_event) - min(ts_event))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_core.fact_trades_tick
+
+  UNION ALL
+  SELECT
+    'feat_hybrid_10ms',
+    min(ts_bucket),
+    max(ts_bucket),
+    ROUND(EXTRACT(EPOCH FROM (max(ts_bucket) - min(ts_bucket))) / 86400.0, 2),
+    COUNT(*)
+  FROM okx_feat.feat_hybrid_10ms
+) q
+ON CONFLICT (logical_date_utc, table_name)
+DO UPDATE SET
+  run_ts_utc   = now(),
+  min_ts       = EXCLUDED.min_ts,
+  max_ts       = EXCLUDED.max_ts,
+  history_days = EXCLUDED.history_days,
+  rows_cnt     = EXCLUDED.rows_cnt;
+"""
+
+# Удаляем всё, кроме текущего logical_date_utc (т.е. храним только один "срез")
 SQL_DELETE_OLD = """
-DELETE FROM okx_health.table_inventory_daily
-WHERE logical_date_utc < (%(logical_date_utc)s::timestamptz - make_interval(days => %(retention_days)s));
+DELETE FROM okx_health.table_ranges_daily
+WHERE logical_date_utc <> %(logical_date_utc)s::timestamptz;
 """
 
 
@@ -154,17 +138,22 @@ def compute_and_store(**context) -> None:
     logical_date_utc = logical_date.astimezone(timezone.utc).isoformat()
 
     hook = PostgresHook(postgres_conn_id=CONN_ID)
+
     conn = hook.get_conn()
+    # важно: одна транзакция на upsert + delete
     conn.autocommit = False
 
     try:
         with conn.cursor() as cur:
+            # 0) DDL (если есть права). Если нет — убери этот блок и создай таблицу админом один раз.
+            cur.execute(SQL_DDL)
+
+            # 1) Upsert текущего среза
             cur.execute(SQL_UPSERT, {"logical_date_utc": logical_date_utc})
-            cur.execute(
-                SQL_DELETE_OLD,
-                {"logical_date_utc": logical_date_utc,
-                    "retention_days": CFG.retention_days},
-            )
+
+            # 2) Только после успешного upsert — удаляем старые срезы
+            cur.execute(SQL_DELETE_OLD, {"logical_date_utc": logical_date_utc})
+
         conn.commit()
     except Exception:
         conn.rollback()
