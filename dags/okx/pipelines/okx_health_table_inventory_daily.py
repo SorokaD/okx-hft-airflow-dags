@@ -15,16 +15,19 @@ TAGS = ["okx", "health", "timescaledb", "inventory", "sanity"]
 
 @dataclass(frozen=True)
 class Config:
-    retention_days: int = 30  # история для Superset (графики роста)
+    retention_days: int = 30  # сколько дней хранить историю
 
 
 CFG = Config()
 
-# ВАЖНО:
-# Таблицу/индексы создай один раз админом.
-# В DAG DDL НЕ выполняем, чтобы не упираться в owner/privileges.
+# 1) Удаляем текущий срез (на эту дату), чтобы сделать чистую перезапись
+SQL_DELETE_THIS_SLICE = r"""
+DELETE FROM okx_health.table_inventory_daily
+WHERE logical_date_utc = %s::timestamptz;
+"""
 
-SQL_UPSERT = r"""
+# 2) Вставляем “как на скрине”: pretty sizes + approx_row_count
+SQL_INSERT_SLICE = r"""
 WITH
 plain_tables AS (
   SELECT
@@ -36,9 +39,6 @@ plain_tables AS (
     (pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes_toast_bytes,
 
     NULLIF(st.n_live_tup, -1)::bigint AS approx_row_count,
-
-    NULL::timestamptz AS min_ts,
-    NULL::timestamptz AS max_ts,
 
     false AS is_hypertable
   FROM pg_class c
@@ -62,10 +62,8 @@ hypertables AS (
       - pg_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)
     ) AS indexes_toast_bytes,
 
-    NULLIF(SUM(pc.reltuples), -1)::bigint AS approx_row_count,
-
-    MIN(c.range_start) AS min_ts,
-    MAX(c.range_end)   AS max_ts,
+    -- оценка строк по чанкам: reltuples может быть отрицательным => оставляем как есть (как у тебя на скрине)
+    SUM(pc.reltuples)::bigint AS approx_row_count,
 
     true AS is_hypertable
   FROM timescaledb_information.hypertables ht
@@ -84,6 +82,7 @@ all_tables AS (
 ),
 
 dedup AS (
+  -- если таблица hypertable, она также видна как обычная таблица: берём hypertable-версию
   SELECT *
   FROM (
     SELECT
@@ -103,13 +102,10 @@ INSERT INTO okx_health.table_inventory_daily (
   table_schema,
   table_name,
   is_hypertable,
-  total_bytes,
-  heap_bytes,
-  indexes_toast_bytes,
-  approx_row_count,
-  min_ts,
-  max_ts,
-  coverage_days
+  total_size,
+  heap_size,
+  indexes_toast_size,
+  approx_row_count
 )
 SELECT
   now() AT TIME ZONE 'utc' AS run_ts_utc,
@@ -117,30 +113,14 @@ SELECT
   table_schema,
   table_name,
   is_hypertable,
-  total_bytes,
-  heap_bytes,
-  indexes_toast_bytes,
-  approx_row_count,
-  min_ts,
-  max_ts,
-  CASE
-    WHEN min_ts IS NULL OR max_ts IS NULL THEN NULL
-    ELSE ROUND(EXTRACT(EPOCH FROM (max_ts - min_ts)) / 86400.0, 2)
-  END AS coverage_days
-FROM dedup
-ON CONFLICT (logical_date_utc, table_schema, table_name)
-DO UPDATE SET
-  run_ts_utc          = now(),
-  is_hypertable       = EXCLUDED.is_hypertable,
-  total_bytes         = EXCLUDED.total_bytes,
-  heap_bytes          = EXCLUDED.heap_bytes,
-  indexes_toast_bytes = EXCLUDED.indexes_toast_bytes,
-  approx_row_count    = EXCLUDED.approx_row_count,
-  min_ts              = EXCLUDED.min_ts,
-  max_ts              = EXCLUDED.max_ts,
-  coverage_days       = EXCLUDED.coverage_days;
+  pg_size_pretty(total_bytes)         AS total_size,
+  pg_size_pretty(heap_bytes)          AS heap_size,
+  pg_size_pretty(indexes_toast_bytes) AS indexes_toast_size,
+  approx_row_count
+FROM dedup;
 """
 
+# 3) Чистим старые срезы
 SQL_DELETE_OLD = r"""
 DELETE FROM okx_health.table_inventory_daily
 WHERE logical_date_utc < (%s::timestamptz - make_interval(days => %s));
@@ -159,10 +139,13 @@ def compute_and_store(**context) -> None:
 
     try:
         with conn.cursor() as cur:
-            # 1) Upsert текущего среза
-            cur.execute(SQL_UPSERT, (logical_date_utc,))
+            # 1) удаляем срез на эту дату (перезапись)
+            cur.execute(SQL_DELETE_THIS_SLICE, (logical_date_utc,))
 
-            # 2) Чистка старых срезов
+            # 2) вставляем новый срез
+            cur.execute(SQL_INSERT_SLICE, (logical_date_utc,))
+
+            # 3) чистим историю
             cur.execute(SQL_DELETE_OLD, (logical_date_utc, CFG.retention_days))
 
         conn.commit()
