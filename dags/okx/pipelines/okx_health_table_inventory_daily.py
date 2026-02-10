@@ -21,7 +21,7 @@ class Config:
 CFG = Config()
 
 # ВАЖНО:
-# Таблицу/индексы создай один раз админом (DDL я ниже повторю).
+# Таблицу/индексы создай один раз админом.
 # В DAG DDL НЕ выполняем, чтобы не упираться в owner/privileges.
 
 SQL_UPSERT = """
@@ -113,7 +113,7 @@ INSERT INTO okx_health.table_inventory_daily (
 )
 SELECT
   now() AT TIME ZONE 'utc' AS run_ts_utc,
-  %(logical_date_utc)s::timestamptz AS logical_date_utc,
+  %s::timestamptz AS logical_date_utc,
   table_schema,
   table_name,
   is_hypertable,
@@ -143,7 +143,7 @@ DO UPDATE SET
 
 SQL_DELETE_OLD = """
 DELETE FROM okx_health.table_inventory_daily
-WHERE logical_date_utc < (%(logical_date_utc)s::timestamptz - make_interval(days => %(retention_days)s));
+WHERE logical_date_utc < (%s::timestamptz - make_interval(days => %s));
 """
 
 
@@ -159,12 +159,12 @@ def compute_and_store(**context) -> None:
 
     try:
         with conn.cursor() as cur:
-            cur.execute(SQL_UPSERT, {"logical_date_utc": logical_date_utc})
-            cur.execute(
-                SQL_DELETE_OLD,
-                {"logical_date_utc": logical_date_utc,
-                    "retention_days": CFG.retention_days},
-            )
+            # 1) Upsert текущего среза
+            cur.execute(SQL_UPSERT, (logical_date_utc,))
+
+            # 2) Чистка старых срезов
+            cur.execute(SQL_DELETE_OLD, (logical_date_utc, CFG.retention_days))
+
         conn.commit()
     except Exception:
         conn.rollback()
