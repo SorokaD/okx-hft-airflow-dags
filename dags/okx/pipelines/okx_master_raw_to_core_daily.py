@@ -30,6 +30,7 @@ CHILD_DAGS_IN_ORDER = [
     "okx_core_to_feat_hybrid_10ms",
     # Health tables:
     "okx_health_table_ranges_daily",
+    "okx_health_table_inventory_daily",
 ]
 
 default_args = {
