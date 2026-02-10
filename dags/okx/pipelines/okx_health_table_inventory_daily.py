@@ -24,7 +24,7 @@ CFG = Config()
 # Таблицу/индексы создай один раз админом.
 # В DAG DDL НЕ выполняем, чтобы не упираться в owner/privileges.
 
-SQL_UPSERT = """
+SQL_UPSERT = r"""
 WITH
 plain_tables AS (
   SELECT
@@ -46,8 +46,8 @@ plain_tables AS (
   LEFT JOIN pg_stat_all_tables st ON st.relid = c.oid
   WHERE c.relkind = 'r'
     AND n.nspname NOT IN ('pg_catalog','information_schema')
-    AND n.nspname NOT LIKE 'pg_toast%'
-    AND n.nspname NOT LIKE '_timescaledb_%'
+    AND n.nspname NOT LIKE 'pg_toast%%'
+    AND n.nspname NOT LIKE '_timescaledb_%%'
 ),
 
 hypertables AS (
@@ -55,11 +55,11 @@ hypertables AS (
     ht.hypertable_schema AS table_schema,
     ht.hypertable_name   AS table_name,
 
-    SUM(pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)) AS total_bytes,
-    SUM(pg_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass))       AS heap_bytes,
+    SUM(pg_total_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)) AS total_bytes,
+    SUM(pg_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass))       AS heap_bytes,
     SUM(
-      pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
-      - pg_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
+      pg_total_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)
+      - pg_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)
     ) AS indexes_toast_bytes,
 
     NULLIF(SUM(pc.reltuples), -1)::bigint AS approx_row_count,
@@ -73,7 +73,7 @@ hypertables AS (
     ON c.hypertable_schema = ht.hypertable_schema
    AND c.hypertable_name   = ht.hypertable_name
   JOIN pg_class pc
-    ON pc.oid = format('%I.%I', c.chunk_schema, c.chunk_name)::regclass
+    ON pc.oid = format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass
   GROUP BY 1,2
 ),
 
@@ -141,7 +141,7 @@ DO UPDATE SET
   coverage_days       = EXCLUDED.coverage_days;
 """
 
-SQL_DELETE_OLD = """
+SQL_DELETE_OLD = r"""
 DELETE FROM okx_health.table_inventory_daily
 WHERE logical_date_utc < (%s::timestamptz - make_interval(days => %s));
 """
