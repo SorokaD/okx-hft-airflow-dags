@@ -11,24 +11,20 @@ DAG_ID = "okx_health_table_ranges_daily"
 SCHEDULE = None  # запускается master DAG (t-1)
 TAGS = ["okx", "health", "timescaledb", "sanity"]
 
-
 SQL_DDL = """
-
 CREATE TABLE IF NOT EXISTS okx_health.table_ranges_daily (
   run_ts_utc       timestamptz NOT NULL DEFAULT now(),
   logical_date_utc timestamptz NOT NULL,
   table_name       text        NOT NULL,
-
   min_ts           timestamptz NULL,
   max_ts           timestamptz NULL,
   history_days     numeric(18,2) NULL,
   rows_cnt         bigint      NOT NULL,
-
   PRIMARY KEY (logical_date_utc, table_name)
 );
 """
 
-SQL_INSERT = """
+SQL_UPSERT = """
 INSERT INTO okx_health.table_ranges_daily
   (logical_date_utc, table_name, min_ts, max_ts, history_days, rows_cnt)
 SELECT
@@ -128,22 +124,42 @@ DO UPDATE SET
   rows_cnt     = EXCLUDED.rows_cnt;
 """
 
+# Удаляем всё, кроме текущего logical_date_utc (т.е. храним только один "срез")
+SQL_DELETE_OLD = """
+DELETE FROM okx_health.table_ranges_daily
+WHERE logical_date_utc <> %(logical_date_utc)s::timestamptz;
+"""
+
 
 def compute_and_store(**context) -> None:
-    # Airflow logical_date обычно tz-aware (UTC). Приведём к UTC явно.
     logical_date = context["dag_run"].logical_date
     if logical_date.tzinfo is None:
         logical_date = logical_date.replace(tzinfo=timezone.utc)
-    logical_date_utc = logical_date.astimezone(timezone.utc)
+    logical_date_utc = logical_date.astimezone(timezone.utc).isoformat()
 
     hook = PostgresHook(postgres_conn_id=CONN_ID)
 
-    # 1) DDL
-    hook.run(SQL_DDL)
+    conn = hook.get_conn()
+    # важно: одна транзакция на upsert + delete
+    conn.autocommit = False
 
-    # 2) Insert/Upsert
-    hook.run(SQL_INSERT, parameters={
-             "logical_date_utc": logical_date_utc.isoformat()})
+    try:
+        with conn.cursor() as cur:
+            # 0) DDL (если есть права). Если нет — убери этот блок и создай таблицу админом один раз.
+            cur.execute(SQL_DDL)
+
+            # 1) Upsert текущего среза
+            cur.execute(SQL_UPSERT, {"logical_date_utc": logical_date_utc})
+
+            # 2) Только после успешного upsert — удаляем старые срезы
+            cur.execute(SQL_DELETE_OLD, {"logical_date_utc": logical_date_utc})
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 with DAG(
