@@ -15,18 +15,16 @@ TAGS = ["okx", "health", "timescaledb", "inventory", "sanity"]
 
 @dataclass(frozen=True)
 class Config:
-    retention_days: int = 30  # сколько дней хранить историю
+    retention_days: int = 30
 
 
 CFG = Config()
 
-# 1) Удаляем текущий срез (на эту дату), чтобы сделать чистую перезапись
 SQL_DELETE_THIS_SLICE = r"""
 DELETE FROM okx_health.table_inventory_daily
 WHERE logical_date_utc = %s::timestamptz;
 """
 
-# 2) Вставляем “как на скрине”: pretty sizes + approx_row_count
 SQL_INSERT_SLICE = r"""
 WITH
 plain_tables AS (
@@ -62,7 +60,7 @@ hypertables AS (
       - pg_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)
     ) AS indexes_toast_bytes,
 
-    -- оценка строк по чанкам: reltuples может быть отрицательным => оставляем как есть (как у тебя на скрине)
+    -- оценка строк по чанкам (как есть; может быть отрицательной, если статистика “кривая”)
     SUM(pc.reltuples)::bigint AS approx_row_count,
 
     true AS is_hypertable
@@ -82,7 +80,7 @@ all_tables AS (
 ),
 
 dedup AS (
-  -- если таблица hypertable, она также видна как обычная таблица: берём hypertable-версию
+  -- hypertable также видна как обычная таблица: берём hypertable-версию
   SELECT *
   FROM (
     SELECT
@@ -120,7 +118,6 @@ SELECT
 FROM dedup;
 """
 
-# 3) Чистим старые срезы
 SQL_DELETE_OLD = r"""
 DELETE FROM okx_health.table_inventory_daily
 WHERE logical_date_utc < (%s::timestamptz - make_interval(days => %s));
@@ -139,15 +136,9 @@ def compute_and_store(**context) -> None:
 
     try:
         with conn.cursor() as cur:
-            # 1) удаляем срез на эту дату (перезапись)
             cur.execute(SQL_DELETE_THIS_SLICE, (logical_date_utc,))
-
-            # 2) вставляем новый срез
             cur.execute(SQL_INSERT_SLICE, (logical_date_utc,))
-
-            # 3) чистим историю
             cur.execute(SQL_DELETE_OLD, (logical_date_utc, CFG.retention_days))
-
         conn.commit()
     except Exception:
         conn.rollback()
