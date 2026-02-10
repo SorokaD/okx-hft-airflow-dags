@@ -15,43 +15,14 @@ TAGS = ["okx", "health", "timescaledb", "inventory", "sanity"]
 
 @dataclass(frozen=True)
 class Config:
-    # хранить историю срезов N дней (для графиков в Superset)
-    retention_days: int = 30
+    retention_days: int = 30  # история для Superset (графики роста)
 
 
 CFG = Config()
 
-SQL_DDL = """
-CREATE SCHEMA IF NOT EXISTS okx_health;
-
-CREATE TABLE IF NOT EXISTS okx_health.table_inventory_daily (
-  run_ts_utc       timestamptz NOT NULL DEFAULT now(),
-  logical_date_utc timestamptz NOT NULL,
-
-  table_schema     text        NOT NULL,
-  table_name       text        NOT NULL,
-
-  is_hypertable    boolean     NOT NULL,
-
-  total_bytes      bigint      NOT NULL,
-  heap_bytes       bigint      NOT NULL,
-  indexes_toast_bytes bigint   NOT NULL,
-
-  approx_row_count bigint      NULL,
-
-  min_ts           timestamptz NULL,
-  max_ts           timestamptz NULL,
-  coverage_days    numeric(18,2) NULL,
-
-  PRIMARY KEY (logical_date_utc, table_schema, table_name)
-);
-
-CREATE INDEX IF NOT EXISTS ix_table_inventory_daily_schema_date
-ON okx_health.table_inventory_daily (table_schema, logical_date_utc);
-
-CREATE INDEX IF NOT EXISTS ix_table_inventory_daily_date
-ON okx_health.table_inventory_daily (logical_date_utc);
-"""
+# ВАЖНО:
+# Таблицу/индексы создай один раз админом (DDL я ниже повторю).
+# В DAG DDL НЕ выполняем, чтобы не упираться в owner/privileges.
 
 SQL_UPSERT = """
 WITH
@@ -64,7 +35,6 @@ plain_tables AS (
     pg_relation_size(c.oid)       AS heap_bytes,
     (pg_total_relation_size(c.oid) - pg_relation_size(c.oid)) AS indexes_toast_bytes,
 
-    -- оценка строк (для health достаточно; COUNT(*) НЕ делаем)
     NULLIF(st.n_live_tup, -1)::bigint AS approx_row_count,
 
     NULL::timestamptz AS min_ts,
@@ -92,7 +62,6 @@ hypertables AS (
       - pg_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
     ) AS indexes_toast_bytes,
 
-    -- оценка строк по чанкам (reltuples иногда -1 => NULL)
     NULLIF(SUM(pc.reltuples), -1)::bigint AS approx_row_count,
 
     MIN(c.range_start) AS min_ts,
@@ -115,8 +84,6 @@ all_tables AS (
 ),
 
 dedup AS (
-  -- если таблица является hypertable, она также видна как "корневая" обычная таблица.
-  -- берём hypertable-версию как более корректную по размеру/coverage.
   SELECT *
   FROM (
     SELECT
@@ -174,7 +141,6 @@ DO UPDATE SET
   coverage_days       = EXCLUDED.coverage_days;
 """
 
-# Чистка истории: держим только последние N дней
 SQL_DELETE_OLD = """
 DELETE FROM okx_health.table_inventory_daily
 WHERE logical_date_utc < (%(logical_date_utc)s::timestamptz - make_interval(days => %(retention_days)s));
@@ -189,25 +155,16 @@ def compute_and_store(**context) -> None:
 
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     conn = hook.get_conn()
-
-    # важно: одна транзакция на DDL + upsert + cleanup
     conn.autocommit = False
 
     try:
         with conn.cursor() as cur:
-            # 0) DDL (если нет прав — сделай один раз руками и убери этот блок)
-            cur.execute(SQL_DDL)
-
-            # 1) Upsert текущего среза
             cur.execute(SQL_UPSERT, {"logical_date_utc": logical_date_utc})
-
-            # 2) Чистка старых срезов
             cur.execute(
                 SQL_DELETE_OLD,
                 {"logical_date_utc": logical_date_utc,
                     "retention_days": CFG.retention_days},
             )
-
         conn.commit()
     except Exception:
         conn.rollback()
