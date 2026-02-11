@@ -15,7 +15,8 @@ TAGS = ["okx", "health", "timescaledb", "inventory", "sanity"]
 
 @dataclass(frozen=True)
 class Config:
-    retention_days: int = 30
+    # оставлено для совместимости/будущего, но сейчас таблица хранит только один срез
+    retention_days: int = 0
 
 
 CFG = Config()
@@ -60,7 +61,7 @@ hypertables AS (
       - pg_relation_size(format('%%I.%%I', c.chunk_schema, c.chunk_name)::regclass)
     ) AS indexes_toast_bytes,
 
-    -- оценка строк по чанкам (как есть; может быть отрицательной, если статистика “кривая”)
+    -- оценка строк по чанкам (может быть отрицательной, если статистика “кривая”)
     SUM(pc.reltuples)::bigint AS approx_row_count,
 
     true AS is_hypertable
@@ -118,9 +119,10 @@ SELECT
 FROM dedup;
 """
 
+# После успешного INSERT оставляем только текущий срез (одна дата logical_date_utc)
 SQL_DELETE_OLD = r"""
 DELETE FROM okx_health.table_inventory_daily
-WHERE logical_date_utc < (%s::timestamptz - make_interval(days => %s));
+WHERE logical_date_utc <> %s::timestamptz;
 """
 
 
@@ -136,9 +138,15 @@ def compute_and_store(**context) -> None:
 
     try:
         with conn.cursor() as cur:
+            # 0) удаляем текущий срез, чтобы перезаписать без дублей
             cur.execute(SQL_DELETE_THIS_SLICE, (logical_date_utc,))
+
+            # 1) вставляем новый срез
             cur.execute(SQL_INSERT_SLICE, (logical_date_utc,))
-            cur.execute(SQL_DELETE_OLD, (logical_date_utc, CFG.retention_days))
+
+            # 2) после успешного insert — удаляем все предыдущие срезы (оставляем только текущий)
+            cur.execute(SQL_DELETE_OLD, (logical_date_utc,))
+
         conn.commit()
     except Exception:
         conn.rollback()
