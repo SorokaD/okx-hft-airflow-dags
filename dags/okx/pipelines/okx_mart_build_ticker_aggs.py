@@ -244,22 +244,13 @@ def run_build() -> None:
     to_ts = day_start_utc(run_dt)
     from_ts = to_ts - timedelta(days=1)
 
-    # фикс TZ на всякий случай
     if from_ts.tzinfo is None:
         from_ts = from_ts.replace(tzinfo=timezone.utc)
     if to_ts.tzinfo is None:
         to_ts = to_ts.replace(tzinfo=timezone.utc)
 
-    cursor.execute(SQL_ENSURE_SCHEMA)
-
-    # ensure tables exist + PK for safety (inst_id, ts_bucket)
-    _ensure_target_table(cursor, CFG.mart_table_1m_fq)
-    _ensure_target_table(cursor, CFG.mart_table_1h_fq)
-    _ensure_target_table(cursor, CFG.mart_table_1d_fq)
-
     print(f"[{DAG_ID}] rebuild window: [{from_ts} .. {to_ts})")
 
-    # rebuild in order: minute -> hour -> day (не критично, но логично)
     _rebuild_window(cursor, CFG.mart_table_1m_fq, "1 minute", from_ts, to_ts)
     print(f"[{DAG_ID}] OK: {CFG.mart_table_1m_fq}")
 
