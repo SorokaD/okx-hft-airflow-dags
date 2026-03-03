@@ -14,13 +14,19 @@ MASTER_DAG_ID = "okx_master_raw_to_core_daily"
 # t-1: 00:10 UTC, data_interval = [вчера 00:00, сегодня 00:00)
 SCHEDULE = "10 0 * * *"
 
-TAGS = ["okx", "etl", "master", "raw-to-core", "t-1"]
+TAGS = [
+    "okx",
+    "etl",
+    "master",
+    "raw-to-core",
+    "t-1",
+]
 
 # Порядок: сначала raw->core, затем core->feat / core->core
 CHILD_DAGS_IN_ORDER = [
+    # Core tables:
     "okx_raw_to_core_ticker_tick",
     "okx_raw_to_core_trades_tick",
-    # "okx_raw_to_core_orderbook_snapshot",
     "okx_raw_to_core_orderbook_l10_snapshot",
     "okx_raw_to_core_funding_rate_tick",
     "okx_raw_to_core_mark_price_tick",
@@ -31,6 +37,8 @@ CHILD_DAGS_IN_ORDER = [
     # Health tables:
     "okx_health_table_ranges_daily",
     "okx_health_table_inventory_daily",
+    # Mart tables:
+    "okx_mart_build_ticker_aggs",
 ]
 
 default_args = {
@@ -95,4 +103,3 @@ with DAG(
         else:
             prev >> trigger
         prev = trigger
- 

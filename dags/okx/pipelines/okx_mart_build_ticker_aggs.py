@@ -26,12 +26,13 @@ DB_NAME_EXPECTED = "okx_hft"
 DAG_ID = "okx_mart_build_ticker_aggs"
 SCHEDULE = None  # запускается мастер-DAG'ом раз в сутки (t-1)
 
-TAGS = ["okx", "etl", "core-to-mart", "timescaledb", "tickers", "superset"]
+TAGS = ["okx", "etl", "core-to-mart", "timescaledb", "tickers", "superset", "mart"]
 
 
 # ============================================================
 # 1) Config
 # ============================================================
+
 
 @dataclass(frozen=True)
 class EtlConfig:
@@ -136,6 +137,7 @@ GROUP BY inst_id, time_bucket(%(bucket_interval)s::interval, ts_event);
 # 3) Helpers
 # ============================================================
 
+
 def _ensure_target_table(cursor, target_fq: str) -> None:
     """
     Минимально-необходимая страховка: если таблица отсутствует — создаём.
@@ -192,12 +194,19 @@ def _ensure_target_table(cursor, target_fq: str) -> None:
         );
         """
     )
-    cursor.execute(f"CREATE INDEX IF NOT EXISTS ix_{target_fq.replace('.', '_')}_ts ON {target_fq} (ts_bucket DESC);")
+    cursor.execute(
+        f"CREATE INDEX IF NOT EXISTS ix_{target_fq.replace('.', '_')}_ts ON {target_fq} (ts_bucket DESC);"
+    )
 
 
-def _rebuild_window(cursor, target_fq: str, bucket_interval: str, from_ts: datetime, to_ts: datetime) -> None:
+def _rebuild_window(
+    cursor, target_fq: str, bucket_interval: str, from_ts: datetime, to_ts: datetime
+) -> None:
     # 1) delete window (idempotency)
-    cursor.execute(SQL_DELETE_BUCKETS.format(target=target_fq), {"from_ts": from_ts, "to_ts": to_ts})
+    cursor.execute(
+        SQL_DELETE_BUCKETS.format(target=target_fq),
+        {"from_ts": from_ts, "to_ts": to_ts},
+    )
 
     # 2) insert recomputed aggregates for window
     params = {"from_ts": from_ts, "to_ts": to_ts, "bucket_interval": bucket_interval}
@@ -211,6 +220,7 @@ def _rebuild_window(cursor, target_fq: str, bucket_interval: str, from_ts: datet
 # 4) Main callable
 # ============================================================
 
+
 def run_build() -> None:
     hook = PostgresHook(postgres_conn_id=CONN_ID)
     conn = hook.get_conn()
@@ -219,7 +229,15 @@ def run_build() -> None:
 
     db_sanity_checks(cursor, DB_NAME_EXPECTED)
     cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
-    log_diagnostics(cursor, [CFG.core_table_fq, CFG.mart_table_1m_fq, CFG.mart_table_1h_fq, CFG.mart_table_1d_fq])
+    log_diagnostics(
+        cursor,
+        [
+            CFG.core_table_fq,
+            CFG.mart_table_1m_fq,
+            CFG.mart_table_1h_fq,
+            CFG.mart_table_1d_fq,
+        ],
+    )
 
     # окно t-1 сутки: [from_ts, to_ts)
     run_dt = get_logical_run_date()
