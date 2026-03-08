@@ -39,7 +39,6 @@ CHILD_DAGS_IN_ORDER = [
     "okx_health_table_inventory_daily",
     # Mart tables:
     "okx_mart_build_ticker_1s",
-    #"okx_mart_build_ticker_aggs",
     "okx_mart_build_index_1s",
 ]
 
