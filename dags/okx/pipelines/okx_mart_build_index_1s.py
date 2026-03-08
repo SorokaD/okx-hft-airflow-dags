@@ -10,8 +10,6 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 from okx.common.etl_common import (
     db_sanity_checks,
-    day_start_utc,
-    get_logical_run_date,
     log_diagnostics,
 )
 
@@ -24,10 +22,9 @@ CONN_ID = "timescaledb"
 DB_NAME_EXPECTED = "okx_hft"
 
 DAG_ID = "okx_mart_build_index_1s"
-SCHEDULE = None  # запускается мастер-DAG'ом раз в сутки (t-1)
+SCHEDULE = None
 
-TAGS = ["okx", "etl", "core-to-mart",
-        "timescaledb", "index", "superset", "mart"]
+TAGS = ["okx", "etl", "core-to-mart", "timescaledb", "index", "superset", "mart"]
 
 
 # ============================================================
@@ -40,6 +37,10 @@ class EtlConfig:
     mart_table_fq: str = "okx_mart.agg_index_1s"
 
     bucket_interval: str = "1 second"
+
+    # Пересобираем от последнего bucket в mart назад на небольшой lookback,
+    # чтобы захватывать late arrivals / пограничные эффекты.
+    rebuild_lookback_sec: int = 1
 
     statement_timeout_ms: int = 30 * 60 * 1000
     execution_timeout_sec: int = 3 * 60 * 60
@@ -54,9 +55,18 @@ CFG = EtlConfig()
 # 2) SQL templates
 # ============================================================
 
-SQL_ENSURE_SCHEMA = "CREATE SCHEMA IF NOT EXISTS okx_mart;"
+SQL_GET_SOURCE_BOUNDS = """
+SELECT
+    min(ts_event) AS min_ts_event,
+    max(ts_event) AS max_ts_event
+FROM {core};
+"""
 
-# Удаляем по bucket_1s, чтобы чистить ровно целевые бакеты окна
+SQL_GET_TARGET_MAX_BUCKET = """
+SELECT max(bucket_1s) AS max_bucket_1s
+FROM {target};
+"""
+
 SQL_DELETE_BUCKETS = """
 DELETE FROM {target}
 WHERE bucket_1s >= %(from_ts)s
@@ -117,88 +127,97 @@ GROUP BY
 # 3) Helpers
 # ============================================================
 
-def _ensure_target_table(cursor, target_fq: str) -> None:
-    cursor.execute(SQL_ENSURE_SCHEMA)
+def _floor_to_second(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.replace(microsecond=0)
 
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {target_fq} (
-            bucket_1s       timestamptz NOT NULL,
-            inst_id         text        NOT NULL,
 
-            open_px         float8 NULL,
-            high_px         float8 NULL,
-            low_px          float8 NULL,
-            close_px        float8 NULL,
+def _ceil_to_next_second(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
 
-            avg_px          float8 NULL,
-            tick_count      int4   NULL,
+    if ts.microsecond == 0:
+        return ts + timedelta(seconds=1)
 
-            range_px        float8 NULL,
-            range_pct       float8 NULL,
-            volatility_px   float8 NULL,
+    return ts.replace(microsecond=0) + timedelta(seconds=1)
 
-            first_event_ts  timestamptz NULL,
-            last_event_ts   timestamptz NULL,
-            last_ingest_ts  timestamptz NULL,
 
-            PRIMARY KEY (bucket_1s, inst_id)
-        );
-        """
+def _get_source_bounds(cursor) -> tuple[datetime | None, datetime | None]:
+    cursor.execute(SQL_GET_SOURCE_BOUNDS.format(core=CFG.core_table_fq))
+    row = cursor.fetchone()
+    return row[0], row[1]
+
+
+def _get_target_max_bucket(cursor) -> datetime | None:
+    cursor.execute(SQL_GET_TARGET_MAX_BUCKET.format(target=CFG.mart_table_fq))
+    row = cursor.fetchone()
+    return row[0]
+
+
+def _resolve_rebuild_window(
+    cursor,
+) -> tuple[datetime | None, datetime | None]:
+    source_min_ts, source_max_ts = _get_source_bounds(cursor)
+
+    if source_min_ts is None or source_max_ts is None:
+        print(f"[{DAG_ID}] source is empty: {CFG.core_table_fq}")
+        return None, None
+
+    if source_min_ts.tzinfo is None:
+        source_min_ts = source_min_ts.replace(tzinfo=timezone.utc)
+    if source_max_ts.tzinfo is None:
+        source_max_ts = source_max_ts.replace(tzinfo=timezone.utc)
+
+    target_max_bucket = _get_target_max_bucket(cursor)
+
+    # Верхняя граница — по фактически доступным данным в source.
+    # Делаем exclusive upper bound.
+    to_ts = _ceil_to_next_second(source_max_ts)
+
+    if target_max_bucket is None:
+        # Первая загрузка: грузим всё, что есть в source.
+        from_ts = _floor_to_second(source_min_ts)
+        print(
+            f"[{DAG_ID}] target is empty -> full bootstrap "
+            f"from source bounds [{from_ts} .. {to_ts})"
+        )
+        return from_ts, to_ts
+
+    if target_max_bucket.tzinfo is None:
+        target_max_bucket = target_max_bucket.replace(tzinfo=timezone.utc)
+
+    # Перестраиваем от последнего bucket назад на lookback,
+    # чтобы безопасно захватить границу и late arrivals.
+    from_ts = target_max_bucket - timedelta(seconds=CFG.rebuild_lookback_sec)
+    from_ts = _floor_to_second(from_ts)
+
+    # Не уходим левее первого source-события
+    source_floor = _floor_to_second(source_min_ts)
+    if from_ts < source_floor:
+        from_ts = source_floor
+
+    if from_ts >= to_ts:
+        print(
+            f"[{DAG_ID}] nothing to do: "
+            f"resolved window [{from_ts} .. {to_ts}) is empty"
+        )
+        return None, None
+
+    print(
+        f"[{DAG_ID}] incremental catch-up window resolved: "
+        f"target_max_bucket={target_max_bucket}, source_max_ts={source_max_ts}, "
+        f"window=[{from_ts} .. {to_ts})"
     )
-
-    cursor.execute(
-        f"""
-        CREATE INDEX IF NOT EXISTS ix_{target_fq.replace('.', '_')}_inst_bucket
-        ON {target_fq} (inst_id, bucket_1s DESC);
-        """
-    )
-
-    cursor.execute(
-        f"""
-        CREATE INDEX IF NOT EXISTS ix_{target_fq.replace('.', '_')}_bucket
-        ON {target_fq} (bucket_1s DESC);
-        """
-    )
-
-
-def _ensure_comments(cursor, target_fq: str) -> None:
-    cursor.execute(
-        f"""
-        COMMENT ON TABLE {target_fq} IS
-        '1-секундная агрегированная mart-таблица по индексной цене инструмента. Используется в Superset для построения базовых дашбордов: цена, OHLC, диапазон движения, волатильность и интенсивность поступления тиков.';
-        """
-    )
-
-    comments = {
-        "bucket_1s": "Начало 1-секундного интервала агрегации по времени события ts_event.",
-        "inst_id": "Идентификатор инструмента (например, BTC-USDT-SWAP).",
-        "open_px": "Первое значение индексной цены index_px внутри 1-секундного интервала.",
-        "high_px": "Максимальное значение индексной цены index_px внутри 1-секундного интервала.",
-        "low_px": "Минимальное значение индексной цены index_px внутри 1-секундного интервала.",
-        "close_px": "Последнее значение индексной цены index_px внутри 1-секундного интервала.",
-        "avg_px": "Среднее значение индексной цены index_px внутри 1-секундного интервала.",
-        "tick_count": "Количество тиков index price, попавших в 1-секундный интервал.",
-        "range_px": "Абсолютный диапазон движения индексной цены внутри 1-секундного интервала: high_px - low_px.",
-        "range_pct": "Относительный диапазон движения индексной цены внутри 1-секундного интервала: (high_px - low_px) / low_px.",
-        "volatility_px": "Стандартное отклонение индексной цены index_px внутри 1-секундного интервала.",
-        "first_event_ts": "Минимальная временная метка ts_event внутри 1-секундного интервала.",
-        "last_event_ts": "Максимальная временная метка ts_event внутри 1-секундного интервала.",
-        "last_ingest_ts": "Максимальная временная метка ts_ingest среди записей, попавших в 1-секундный интервал.",
-    }
-
-    for col, text in comments.items():
-        cursor.execute(f"COMMENT ON COLUMN {target_fq}.{col} IS %s;", (text,))
+    return from_ts, to_ts
 
 
 def _rebuild_window(cursor, target_fq: str, from_ts: datetime, to_ts: datetime) -> None:
-    # 1) удаляем целевые бакеты окна
     cursor.execute(
         SQL_DELETE_BUCKETS.format(target=target_fq),
         {"from_ts": from_ts, "to_ts": to_ts},
     )
 
-    # 2) вставляем заново пересчитанные агрегаты
     cursor.execute(
         SQL_INSERT_AGG.format(target=target_fq, core=CFG.core_table_fq),
         {
@@ -222,9 +241,6 @@ def run_build() -> None:
     db_sanity_checks(cursor, DB_NAME_EXPECTED)
     cursor.execute("SET statement_timeout = %s", (CFG.statement_timeout_ms,))
 
-    _ensure_target_table(cursor, CFG.mart_table_fq)
-    _ensure_comments(cursor, CFG.mart_table_fq)
-
     log_diagnostics(
         cursor,
         [
@@ -233,15 +249,11 @@ def run_build() -> None:
         ],
     )
 
-    # окно t-1 сутки: [from_ts, to_ts)
-    run_dt = get_logical_run_date()
-    to_ts = day_start_utc(run_dt)
-    from_ts = to_ts - timedelta(days=1)
+    from_ts, to_ts = _resolve_rebuild_window(cursor)
 
-    if from_ts.tzinfo is None:
-        from_ts = from_ts.replace(tzinfo=timezone.utc)
-    if to_ts.tzinfo is None:
-        to_ts = to_ts.replace(tzinfo=timezone.utc)
+    if from_ts is None or to_ts is None:
+        print(f"[{DAG_ID}] SKIP: nothing to rebuild")
+        return
 
     print(f"[{DAG_ID}] rebuild window: [{from_ts} .. {to_ts})")
 
@@ -264,7 +276,7 @@ default_args: dict[str, Any] = {
 
 with DAG(
     dag_id=DAG_ID,
-    description="OKX MART: daily rebuild 1-second index aggregates for t-1 window, idempotent (delete+insert)",
+    description="OKX MART: source-driven incremental catch-up rebuild for 1-second index aggregates",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
     schedule=SCHEDULE,
