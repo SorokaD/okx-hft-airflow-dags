@@ -40,6 +40,7 @@ CHILD_DAGS_IN_ORDER = [
     # Mart tables:
     "okx_mart_build_ticker_1s",
     "okx_mart_build_index_1s",
+    "okx_mart_build_mark_price_1s",
 ]
 
 default_args = {
@@ -63,7 +64,8 @@ with DAG(
         """Падаем, если хотя бы один дочерний DAG на паузе — иначе зелёный мастер без данных."""
         with create_session() as session:
             for dag_id in CHILD_DAGS_IN_ORDER:
-                row = session.query(DagModel).filter(DagModel.dag_id == dag_id).first()
+                row = session.query(DagModel).filter(
+                    DagModel.dag_id == dag_id).first()
                 if row is None:
                     raise RuntimeError(
                         f"[{MASTER_DAG_ID}] Дочерний DAG не найден: {dag_id}"
