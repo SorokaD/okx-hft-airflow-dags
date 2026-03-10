@@ -41,6 +41,7 @@ CHILD_DAGS_IN_ORDER = [
     "okx_mart_build_ticker_1s",
     "okx_mart_build_index_1s",
     "okx_mart_build_mark_price_1s",
+    "okx_mart_build_open_interest_1s",
 ]
 
 default_args = {
