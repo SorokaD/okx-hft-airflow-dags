@@ -62,3 +62,5 @@ airflow_home/
 *.key
 secrets.yaml
 .env.local
+.cursorignore
+.gitignore
