@@ -32,6 +32,7 @@ CHILD_DAGS_IN_ORDER = [
     "okx_raw_to_core_mark_price_tick",
     "okx_raw_to_core_open_interest_tick",
     "okx_raw_to_core_index_tick",
+    "okx_core_build_orderbook_l10_100ms",
     "okx_core_tick_to_core_funding_rate_event",
     "okx_core_to_feat_hybrid_10ms",
     # Health tables:
