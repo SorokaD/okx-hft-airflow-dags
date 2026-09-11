@@ -64,6 +64,8 @@ class EtlConfig:
     # snapshots arrive ~every 30s; look back far enough for an anchor
     anchor_lookback_ms: int = 5 * 60 * 1000
     chunk_minutes: int = 15
+    # Safety cap if a watermark exists but is stale. Empty table does NOT
+    # use this: first run starts at the live tail (no historical backfill).
     max_catchup_hours_per_run: int | None = 24
     update_gap_threshold_ms: int = 5_000
     insert_batch_size: int = 5_000
@@ -242,14 +244,21 @@ def run_sync() -> None:
         if CFG.max_catchup_hours_per_run is None
         else int(CFG.max_catchup_hours_per_run) * 3600 * 1000
     )
+    live_tail_ms = max(src_min_ms, to_ms - overlap_ms)
 
-    global_from = src_min_ms
     if watermarks:
         global_from = min(watermarks.values()) - overlap_ms
         if global_from < src_min_ms:
             global_from = src_min_ms
-    if catchup_ms is not None and to_ms - global_from > catchup_ms:
-        global_from = to_ms - catchup_ms
+        if catchup_ms is not None and to_ms - global_from > catchup_ms:
+            global_from = to_ms - catchup_ms
+    else:
+        # No rows in target: start from now, do not reconstruct history.
+        global_from = live_tail_ms
+        print(
+            f"[{DAG_ID}] empty target: bootstrap from live tail "
+            f"window=[{global_from}..{to_ms}) (no backfill)"
+        )
 
     if global_from >= to_ms:
         print(
@@ -277,7 +286,7 @@ def run_sync() -> None:
     for inst_id in instids:
         wm = watermarks.get(inst_id)
         if wm is None:
-            from_ms = global_from
+            from_ms = live_tail_ms
         else:
             from_ms = wm - overlap_ms
             if from_ms < src_min_ms:

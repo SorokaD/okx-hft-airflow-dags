@@ -130,7 +130,9 @@ DAG: `okx_core_build_orderbook_l10_100ms` (`schedule=None`, triggered by
 - Each chunk loads the last real snapshot **≤ from_ts** (anchor),
   replays updates up to `from_ts` without writing, then samples
   `[from_ts, to_ts)`
-- Catch-up cap: 24 hours per run
+- Empty target: start at the live tail (overlap window only). No
+  historical backfill on first run.
+- If a watermark exists but is stale: cap 24 hours per run
 - Chunk size: 15 minutes of event time, one instrument at a time
 - Bulk upsert via `psycopg2.extras.execute_values`
 
